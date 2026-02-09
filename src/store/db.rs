@@ -14,7 +14,7 @@ use crate::V;
 
 use prefix_uvarint::PrefixVarInt;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     hash::Hasher,
     path::Path,
     sync::{
@@ -24,14 +24,17 @@ use std::{
 };
 
 use crate::{
-    store::{BlockMeta, Store, TxSeen},
+    store::{BlockMeta, SpentUtxo, Store, TxSeen},
     Height, ScriptHash,
 };
+use crate::store::REORG_BUFFER_MAX_DEPTH;
 
-/// Data for handling reorgs up to 1 block.
-/// If the process halts right before a reorg, this will be lost and a reindex must happen.
+/// Data for handling reorgs using an in-memory undo buffer.
+/// If the process halts or a reorg exceeds the buffer depth, a reindex must happen.
 #[derive(Debug, Default)]
 struct ReorgData {
+    /// Height of the block this undo data refers to.
+    height: Height,
     /// Input spent in the last block. These are usually deleted from the db when a block is found.
     /// When there is a reorg we reinsert them in the db.
     spent: Vec<(OutPoint, ScriptHash)>,
@@ -54,7 +57,7 @@ pub struct DBStore {
     salt: u64,
 
     /// Reorg data for handling blockchain reorganizations
-    reorg_data: Mutex<ReorgData>,
+    reorg_data: Mutex<VecDeque<ReorgData>>,
 
     /// Whether we are in Initial Block Download mode.
     /// during initial block download we do something different to speed up initial indexing, like writing disabling the wal.
@@ -175,7 +178,7 @@ impl DBStore {
         let store = DBStore {
             db,
             salt,
-            reorg_data: Mutex::new(ReorgData::default()),
+            reorg_data: Mutex::new(VecDeque::new()),
             ibd: AtomicBool::new(true),
         };
         Ok(store)
@@ -206,6 +209,34 @@ impl DBStore {
         batch.put_cf(&self.hashes_cf(), meta.height().to_be_bytes(), buffer);
     }
 
+    /// Remove block hash and timestamp for a given height from an existing batch.
+    fn delete_hash_ts_batch(&self, batch: &mut rocksdb::WriteBatch, height: Height) {
+        batch.delete_cf(&self.hashes_cf(), height.to_be_bytes());
+    }
+
+    fn push_reorg_data(&self, data: ReorgData) {
+        let mut reorg_data = self.reorg_data.lock().unwrap();
+        reorg_data.push_back(data);
+        if reorg_data.len() > REORG_BUFFER_MAX_DEPTH {
+            let dropped = reorg_data.pop_front().expect("len > max depth");
+            log::warn!(
+                "reorg buffer depth exceeded ({}); dropping undo data for height {}",
+                REORG_BUFFER_MAX_DEPTH,
+                dropped.height
+            );
+        }
+    }
+
+    fn pop_reorg_data(&self) -> ReorgData {
+        let mut reorg_data = self.reorg_data.lock().unwrap();
+        reorg_data.pop_back().unwrap_or_else(|| {
+            error_panic!(
+                "reorg depth exceeded in-memory buffer ({}); reindex required",
+                REORG_BUFFER_MAX_DEPTH
+            )
+        })
+    }
+
     fn insert_utxos<'a, I>(&self, batch: &mut rocksdb::WriteBatch, adds: I) -> Result<()>
     where
         I: IntoIterator<Item = (&'a OutPoint, &'a ScriptHash)>,
@@ -224,25 +255,37 @@ impl DBStore {
         Ok(())
     }
 
-    /// Look up UTXOs and return their script hashes, panicking if any UTXO doesn't exist.
+    /// Look up UTXOs and return their script hashes, erroring if any UTXO doesn't exist.
     /// This is a read-only operation.
     fn get_utxos_for_spending(
         &self,
         outpoints: &[OutPoint],
     ) -> Result<Vec<(OutPoint, ScriptHash)>> {
-        let result: Vec<ScriptHash> = self
-            .get_utxos(outpoints)?
-            .iter()
-            .enumerate()
-            .map(|(i, e)| {
-                e.unwrap_or_else(|| {
-                    error_panic!(
-                        "every utxo must exist when spent, can't find {}",
-                        outpoints[i]
-                    );
-                })
-            })
-            .collect();
+        let utxos = self.get_utxos(outpoints)?;
+        let mut missing = Vec::new();
+        let mut result = Vec::with_capacity(outpoints.len());
+
+        for (i, entry) in utxos.into_iter().enumerate() {
+            match entry {
+                Some(script_hash) => result.push(script_hash),
+                None => missing.push(outpoints[i]),
+            }
+        }
+
+        if !missing.is_empty() {
+            let preview: Vec<String> = missing
+                .iter()
+                .take(5)
+                .map(|o| o.to_string())
+                .collect();
+            anyhow::bail!(
+                "every utxo must exist when spent; missing {} outpoints (sample: [{}]). \
+DB may be inconsistent (reorg deeper than buffer or corrupted) and requires reindex",
+                missing.len(),
+                preview.join(", ")
+            );
+        }
+
         Ok(Vec::from_iter(
             outpoints.iter().cloned().zip(result.iter().cloned()),
         ))
@@ -460,6 +503,13 @@ impl DBStore {
             self.db.write(batch)?
         })
     }
+
+    pub(crate) fn write_hash_ts(&self, meta: &BlockMeta) -> Result<()> {
+        let mut batch = rocksdb::WriteBatch::with_capacity_bytes(40);
+        self.set_hash_ts_batch(&mut batch, meta);
+        self.write(batch)?;
+        Ok(())
+    }
 }
 
 fn estimate_history_size(add: &BTreeMap<u64, Vec<TxSeen>>) -> usize {
@@ -546,21 +596,21 @@ impl Store for DBStore {
     fn update(
         &self,
         block_meta: &BlockMeta,
-        utxo_spent: Vec<(u32, OutPoint, crate::be::Txid)>,
+        utxo_spent: Vec<SpentUtxo>,
         history_map: BTreeMap<ScriptHash, Vec<TxSeen>>,
         utxo_created: BTreeMap<OutPoint, ScriptHash>,
     ) -> Result<()> {
         let mut history_map = history_map;
 
-        // First, read the script hashes for spent UTXOs (read-only operation)
-        let only_outpoints: Vec<_> = utxo_spent.iter().map(|e| e.1).collect();
-        let outpoint_script_hashes = self.get_utxos_for_spending(&only_outpoints)?;
-
         // Build the history entries for spending transactions
-        let script_hashes = outpoint_script_hashes.iter().map(|e| e.1);
-        for (script_hash, (vin, _, txid)) in script_hashes.into_iter().zip(utxo_spent) {
-            let el = history_map.entry(script_hash).or_default();
-            el.push(TxSeen::new(txid, block_meta.height(), V::Vin(vin)));
+        let only_outpoints: Vec<_> = utxo_spent.iter().map(|e| e.outpoint).collect();
+        for spent in utxo_spent.iter() {
+            let el = history_map.entry(spent.script_hash).or_default();
+            el.push(TxSeen::new(
+                spent.txid,
+                block_meta.height(),
+                V::Vin(spent.vin),
+            ));
         }
 
         // Create a single batch for ALL writes (atomic operation)
@@ -587,22 +637,27 @@ impl Store for DBStore {
         self.write(batch)?;
 
         // Store reorg data for potential blockchain reorganization correction
-        {
-            let mut reorg_data = self.reorg_data.lock().unwrap();
-            reorg_data.spent = outpoint_script_hashes;
-            reorg_data.history = history_map;
-            reorg_data.utxos_created = utxo_created;
-        }
+        let outpoint_script_hashes: Vec<(OutPoint, ScriptHash)> = utxo_spent
+            .iter()
+            .map(|spent| (spent.outpoint, spent.script_hash))
+            .collect();
+
+        self.push_reorg_data(ReorgData {
+            height: block_meta.height(),
+            spent: outpoint_script_hashes,
+            history: history_map,
+            utxos_created: utxo_created,
+        });
 
         Ok(())
     }
 
     fn reorg(&self) {
-        let reorg_data = self.reorg_data.lock().unwrap();
+        let reorg_data = self.pop_reorg_data();
 
         // Estimate batch size for UTXO restoration
         let utxo_restore_size = reorg_data.spent.len() * 44; // 44 bytes per UTXO entry
-        let mut batch = rocksdb::WriteBatch::with_capacity_bytes(utxo_restore_size);
+        let mut batch = rocksdb::WriteBatch::with_capacity_bytes(utxo_restore_size + 4);
 
         // Restore UTXOs that were spent in the reorged block
         self.insert_utxos(
@@ -614,24 +669,32 @@ impl Store for DBStore {
         )
         .unwrap(); // TODO handle unwrap;
 
+        self.delete_hash_ts_batch(&mut batch, reorg_data.height);
+
         self.write(batch).unwrap(); // TODO handle unwrap;
 
         // Remove UTXOs that were created in the reorged block
         if !reorg_data.utxos_created.is_empty() {
             let outpoints_to_remove: Vec<OutPoint> =
                 reorg_data.utxos_created.keys().cloned().collect();
-            self.remove_utxos(&outpoints_to_remove).unwrap(); // TODO handle unwrap;
+            self.remove_utxos(&outpoints_to_remove)
+                .unwrap_or_else(|e| error_panic!("failed to remove reorg-created utxos: {e}"));
         }
 
         // Remove history entries that were added in the reorged block
         if !reorg_data.history.is_empty() {
-            self.remove_history_entries(&reorg_data.history).unwrap(); // TODO handle unwrap;
+            self.remove_history_entries(&reorg_data.history)
+                .unwrap_or_else(|e| error_panic!("failed to remove reorg history entries: {e}"));
         }
     }
 
     fn ibd_finished(&self) {
         log::info!("Initial block download finished, setting ibd to false in the store");
         self.ibd.store(false, Ordering::Relaxed);
+    }
+
+    fn put_hash_ts(&self, meta: &BlockMeta) -> Result<()> {
+        self.write_hash_ts(meta)
     }
 }
 
@@ -721,17 +784,17 @@ mod test {
     use elements::{hashes::Hash, BlockHash, OutPoint, Txid};
     use rocksdb::DB;
     use std::{
-        collections::BTreeMap,
+        collections::{BTreeMap, VecDeque},
         sync::{atomic::AtomicBool, Mutex},
     };
 
-    use crate::store::{
-        db::{
-            estimate_history_size, get_or_init_salt, serialize_outpoint, vec_tx_seen_from_be_bytes,
-            vec_tx_seen_to_be_bytes, ReorgData, TxSeen,
-        },
-        Store,
-    };
+        use crate::store::{
+            db::{
+                estimate_history_size, get_or_init_salt, serialize_outpoint, vec_tx_seen_from_be_bytes,
+                vec_tx_seen_to_be_bytes, TxSeen,
+            },
+            BlockMeta, SpentUtxo, Store,
+        };
     use crate::V;
 
     use super::DBStore;
@@ -745,7 +808,7 @@ mod test {
         let db = DBStore {
             db: DB::open(&opts, tempdir.path()).unwrap(),
             salt: 0,
-            reorg_data: Mutex::new(ReorgData::default()),
+            reorg_data: Mutex::new(VecDeque::new()),
             ibd: AtomicBool::new(true),
         };
         let hash = db.hash(b"test");
@@ -953,5 +1016,99 @@ mod test {
             script_hashes_by_ord, script_hashes_sorted_by_encoding,
             "ScriptHash (u64) natural ordering must match binary encoding ordering"
         );
+    }
+
+    #[test]
+    fn test_reorg_buffer_multiple_blocks() {
+        let tempdir = tempfile::TempDir::new().unwrap();
+        let db = DBStore::open(tempdir.path(), 64, false).unwrap();
+
+        let script_a = db.hash(b"script-a");
+        let script_b = db.hash(b"script-b");
+        let script_c = db.hash(b"script-c");
+
+        let txid0 = crate::be::Txid::from_array([1u8; 32]);
+        let txid1 = crate::be::Txid::from_array([2u8; 32]);
+        let txid2 = crate::be::Txid::from_array([3u8; 32]);
+
+        let out_a = OutPoint::new(txid0.elements(), 0);
+        let out_b = OutPoint::new(txid1.elements(), 0);
+        let out_c = OutPoint::new(txid2.elements(), 0);
+
+        let block0 = BlockMeta::new(0, BlockHash::all_zeros(), 0);
+        let mut history0 = BTreeMap::new();
+        history0.insert(script_a, vec![TxSeen::new(txid0, 0, V::Vout(0))]);
+        let mut utxo_created0 = BTreeMap::new();
+        utxo_created0.insert(out_a, script_a);
+        db.update(&block0, vec![], history0, utxo_created0)
+            .unwrap();
+
+        let block1 = BlockMeta::new(1, BlockHash::all_zeros(), 0);
+        let mut history1 = BTreeMap::new();
+        history1.insert(script_b, vec![TxSeen::new(txid1, 1, V::Vout(0))]);
+        let mut utxo_created1 = BTreeMap::new();
+        utxo_created1.insert(out_b, script_b);
+        db.update(
+            &block1,
+            vec![SpentUtxo {
+                vin: 0,
+                outpoint: out_a,
+                txid: txid1,
+                script_hash: script_a,
+            }],
+            history1,
+            utxo_created1,
+        )
+            .unwrap();
+
+        let block2 = BlockMeta::new(2, BlockHash::all_zeros(), 0);
+        let mut history2 = BTreeMap::new();
+        history2.insert(script_c, vec![TxSeen::new(txid2, 2, V::Vout(0))]);
+        let mut utxo_created2 = BTreeMap::new();
+        utxo_created2.insert(out_c, script_c);
+        db.update(
+            &block2,
+            vec![SpentUtxo {
+                vin: 0,
+                outpoint: out_b,
+                txid: txid2,
+                script_hash: script_b,
+            }],
+            history2,
+            utxo_created2,
+        )
+            .unwrap();
+
+        let heights: Vec<_> = db.iter_hash_ts().map(|m| m.height()).collect();
+        assert_eq!(heights, vec![0, 1, 2]);
+
+        let utxos = db.get_utxos(&[out_a, out_b, out_c]).unwrap();
+        assert_eq!(utxos, vec![None, None, Some(script_c)]);
+
+        // Reorg block 2.
+        db.reorg();
+        let heights: Vec<_> = db.iter_hash_ts().map(|m| m.height()).collect();
+        assert_eq!(heights, vec![0, 1]);
+
+        let utxos = db.get_utxos(&[out_a, out_b, out_c]).unwrap();
+        assert_eq!(utxos, vec![None, Some(script_b), None]);
+
+        let history_b = db.get_history(&[script_b]).unwrap();
+        assert_eq!(history_b[0], vec![TxSeen::new(txid1, 1, V::Vout(0))]);
+        let history_c = db.get_history(&[script_c]).unwrap();
+        assert!(history_c[0].is_empty());
+
+        // Reorg block 1.
+        db.reorg();
+        let heights: Vec<_> = db.iter_hash_ts().map(|m| m.height()).collect();
+        assert_eq!(heights, vec![0]);
+
+        let utxos = db.get_utxos(&[out_a, out_b]).unwrap();
+        assert_eq!(utxos, vec![Some(script_a), None]);
+
+        let history_a = db.get_history(&[script_a]).unwrap();
+        assert_eq!(history_a[0], vec![TxSeen::new(txid0, 0, V::Vout(0))]);
+        let history_b = db.get_history(&[script_b]).unwrap();
+        assert!(history_b[0].is_empty());
     }
 }
