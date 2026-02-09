@@ -8,10 +8,22 @@ pub mod db;
 
 pub mod memory;
 
+/// Maximum number of recent blocks to keep for in-memory reorg undo data.
+/// If a deeper reorg happens, a full reindex is required.
+pub(crate) const REORG_BUFFER_MAX_DEPTH: usize = 100;
+
 pub enum AnyStore {
     #[cfg(feature = "db")]
     Db(db::DBStore),
     Mem(memory::MemoryStore),
+}
+
+#[derive(Clone, Debug)]
+pub struct SpentUtxo {
+    pub vin: u32,
+    pub outpoint: OutPoint,
+    pub txid: crate::be::Txid,
+    pub script_hash: ScriptHash,
 }
 impl AnyStore {
     pub(crate) fn stats(&self) -> Option<String> {
@@ -43,10 +55,13 @@ pub trait Store {
     fn update(
         &self,
         block_meta: &BlockMeta,
-        utxo_spent: Vec<(u32, OutPoint, crate::be::Txid)>,
+        utxo_spent: Vec<SpentUtxo>,
         history_map: BTreeMap<ScriptHash, Vec<TxSeen>>, // We want this sorted because when inserted in the write batch it's faster (see benches and test guaranteeing encoding order match struct ordering)
         utxo_created: BTreeMap<OutPoint, ScriptHash>, // We want this sorted because when inserted in the write batch it's faster (see benches and test guaranteeing encoding order match struct ordering)
     ) -> Result<()>;
+
+    /// Persist a block hash + timestamp entry for header preloading or repairs.
+    fn put_hash_ts(&self, meta: &BlockMeta) -> Result<()>;
 
     /// Reorg, reinsert the last block unspent utxos
     fn reorg(&self);
@@ -91,7 +106,7 @@ impl Store for AnyStore {
     fn update(
         &self,
         block_meta: &BlockMeta,
-        utxo_spent: Vec<(u32, OutPoint, crate::be::Txid)>,
+        utxo_spent: Vec<SpentUtxo>,
         history_map: BTreeMap<ScriptHash, Vec<TxSeen>>,
         utxo_created: BTreeMap<OutPoint, ScriptHash>,
     ) -> Result<()> {
@@ -99,6 +114,14 @@ impl Store for AnyStore {
             #[cfg(feature = "db")]
             AnyStore::Db(d) => d.update(block_meta, utxo_spent, history_map, utxo_created),
             AnyStore::Mem(m) => m.update(block_meta, utxo_spent, history_map, utxo_created),
+        }
+    }
+
+    fn put_hash_ts(&self, meta: &BlockMeta) -> Result<()> {
+        match self {
+            #[cfg(feature = "db")]
+            AnyStore::Db(d) => d.put_hash_ts(meta),
+            AnyStore::Mem(m) => m.put_hash_ts(meta),
         }
     }
 

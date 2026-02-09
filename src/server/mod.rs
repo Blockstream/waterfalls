@@ -264,6 +264,7 @@ pub enum Error {
     InvalidBlockHash,
     CannotFindBlockHeader,
     DBOpen(String),
+    DBCorrupted(String),
     CannotLoadEncryptionKey,
     CannotDecrypt,
     CannotEncrypt,
@@ -354,7 +355,8 @@ pub async fn inner_main(
 
     {
         let state = state.clone();
-        headers(state).await.unwrap();
+        let preload_client = Client::new(&args)?;
+        headers(state, Some(&preload_client), args.network.into()).await?;
     }
 
     // Create oneshot channel to signal when initial block download is complete

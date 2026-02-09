@@ -2,12 +2,12 @@ use crate::{
     be::Family,
     fetch::{ChainStatus, Client},
     server::{Error, State},
-    store::{BlockMeta, Store},
+    store::{BlockMeta, SpentUtxo, Store},
     TxSeen, V,
 };
 use elements::{OutPoint, Txid};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     future::Future,
     str::FromStr,
     sync::Arc,
@@ -232,6 +232,16 @@ pub async fn index(
             }
         }
         state.set_hash_ts(&block_to_index).await;
+        let utxo_spent = resolve_spent_utxos(
+            &state,
+            &client,
+            family,
+            &block_to_index,
+            utxo_spent,
+        )
+        .await
+        .unwrap_or_else(|e| error_panic!("error resolving spent utxos: {e}"));
+
         db.update(&block_to_index, utxo_spent, history_map, utxo_created)
             .unwrap_or_else(|e| error_panic!("error updating db: {e}"));
 
@@ -253,4 +263,87 @@ fn generate_skip_outpoint() -> HashSet<OutPoint> {
     skip_outpoint.insert(outpoint(s, 0));
 
     skip_outpoint
+}
+
+async fn resolve_spent_utxos(
+    state: &Arc<State>,
+    client: &Client,
+    family: Family,
+    block_meta: &BlockMeta,
+    utxo_spent: Vec<(u32, OutPoint, crate::be::Txid)>,
+) -> Result<Vec<SpentUtxo>, Error> {
+    if utxo_spent.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let outpoints: Vec<OutPoint> = utxo_spent.iter().map(|e| e.1).collect();
+    let mut script_hashes = state
+        .store
+        .get_utxos(&outpoints)
+        .map_err(|e| Error::String(format!("failed to get utxos for block {block_meta:?}: {e}")))?;
+
+    let mut missing_by_txid: HashMap<crate::be::Txid, Vec<(usize, u32)>> = HashMap::new();
+    for (idx, (outpoint, script_hash)) in outpoints.iter().zip(script_hashes.iter()).enumerate() {
+        if script_hash.is_none() {
+            missing_by_txid
+                .entry((*outpoint).txid.into())
+                .or_default()
+                .push((idx, outpoint.vout));
+        }
+    }
+
+    if !missing_by_txid.is_empty() {
+        let missing_count: usize = missing_by_txid.values().map(|v| v.len()).sum();
+        log::warn!(
+            "missing {missing_count} spent utxos while indexing height {}; backfilling from node",
+            block_meta.height
+        );
+        for (txid, entries) in missing_by_txid {
+            let tx = client
+                .tx(txid, family)
+                .await
+                .map_err(|e| Error::String(format!("failed to fetch missing tx {txid}: {e}")))?;
+            for (idx, vout) in entries {
+                let output = tx
+                    .outputs_iter()
+                    .nth(vout as usize)
+                    .ok_or_else(|| {
+                        Error::String(format!(
+                            "missing vout {vout} for tx {txid} while repairing utxo"
+                        ))
+                    })?;
+
+                if output.skip_utxo() {
+                    return Err(Error::String(format!(
+                        "missing utxo {txid}:{vout} is unspendable, refusing to repair"
+                    )));
+                }
+
+                let script_hash = if output.skip_indexing() {
+                    state.store.hash(b"")
+                } else {
+                    state.store.hash(output.script_pubkey_bytes())
+                };
+                script_hashes[idx] = Some(script_hash);
+            }
+        }
+    }
+
+    let mut spent = Vec::with_capacity(utxo_spent.len());
+    for (idx, (vin, outpoint, txid)) in utxo_spent.into_iter().enumerate() {
+        let script_hash = script_hashes[idx].ok_or_else(|| {
+            Error::String(format!(
+                "missing utxo {} could not be repaired, reindex required",
+                outpoint
+            ))
+        })?;
+        spent.push(SpentUtxo {
+            vin,
+            outpoint,
+            txid,
+            script_hash,
+        });
+    }
+
+    Ok(spent)
 }
