@@ -1,6 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-};
+use std::collections::{HashMap, HashSet};
 
 use crate::{
     be,
@@ -65,13 +63,11 @@ impl Mempool {
 
     fn add(&mut self, db: &AnyStore, txs: &[(crate::be::Txid, &be::MempoolTx)]) {
         // update the unconfirmed utxo set
-        let outputs_created = txs
-            .iter()
-            .flat_map(|(txid, tx)| {
-                tx.output_script_hashes_iter()
-                    .enumerate()
-                    .map(move |(vout, script_hash)| (OutPoint::new(*txid, vout as u32), script_hash))
-            });
+        let outputs_created = txs.iter().flat_map(|(txid, tx)| {
+            tx.output_script_hashes_iter()
+                .enumerate()
+                .map(move |(vout, script_hash)| (OutPoint::new(*txid, vout as u32), script_hash))
+        });
         self.outpoints_created.extend(outputs_created);
 
         // we need to build this map for every txid all the ScriptHash involved, for output is easy
@@ -82,10 +78,7 @@ impl Mempool {
         let mut txid_script_positions: HashMap<crate::be::Txid, Vec<(ScriptHash, i32)>> =
             HashMap::with_capacity(txs.len());
 
-        let prevouts: Vec<OutPoint> = txs
-            .iter()
-            .flat_map(|e| e.1.inputs_iter())
-            .collect();
+        let prevouts: Vec<OutPoint> = txs.iter().flat_map(|e| e.1.inputs_iter()).collect();
         let spending_script_hashes = db.get_utxos(&prevouts).unwrap();
 
         let mut prevouts_index = 0usize;
@@ -155,7 +148,11 @@ impl Mempool {
     pub fn has_seen(&self, script_hashes: &[ScriptHash]) -> Vec<bool> {
         let mut result = Vec::with_capacity(script_hashes.len());
         for h in script_hashes {
-            result.push(self.hash_txids.get(h).is_some_and(|entries| !entries.is_empty()));
+            result.push(
+                self.hash_txids
+                    .get(h)
+                    .is_some_and(|entries| !entries.is_empty()),
+            );
         }
         result
     }
@@ -168,7 +165,11 @@ impl Mempool {
         MempoolStats {
             txids: self.txid_hashes.len(),
             script_hashes: self.hash_txids.len(),
-            positions: self.hash_txids.values().map(|positions| positions.len()).sum(),
+            positions: self
+                .hash_txids
+                .values()
+                .map(|positions| positions.len())
+                .sum(),
             outpoints_created: self.outpoints_created.len(),
         }
     }
