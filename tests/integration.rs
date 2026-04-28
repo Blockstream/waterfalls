@@ -63,12 +63,77 @@ async fn integration_addresses_txs_seen_truncation() {
     #[cfg(not(feature = "db"))]
     let test_env = waterfalls::test_env::launch_with_max_txs_seen(exe, Family::Bitcoin, 3).await;
 
-    let addr = test_env.get_new_address(None);
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let private_key = bitcoin::PrivateKey::generate(bitcoin::NetworkKind::Test);
+    let external_addr = bitcoin::Address::p2pkh(private_key.public_key(&secp), bitcoin::Network::Regtest);
+    let addr = be::Address::from_str(&external_addr.to_string(), test_env.network()).unwrap();
     let mut expected_txids = Vec::new();
     for _ in 0..5 {
-        expected_txids.push(test_env.send_to(&addr, 10_000));
+        let txid = test_env.send_to(&addr, 10_000);
+        expected_txids.push(txid);
         test_env.node_generate(1).await;
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let result_page_0 = test_env
+                    .client()
+                    .waterfalls_addresses(&vec![addr.clone()])
+                    .await
+                    .unwrap()
+                    .0;
+                let result_page_1 = test_env
+                    .client()
+                    .waterfalls_addresses_with_page(&vec![addr.clone()], 1)
+                    .await
+                    .unwrap()
+                    .0;
+                let found_in_history = result_page_0.txs_seen["addresses"][0]
+                    .iter()
+                    .chain(result_page_1.txs_seen["addresses"][0].iter())
+                    .any(|tx_seen| tx_seen.txid == txid && tx_seen.height > 0);
+                if found_in_history {
+                    break;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for mined tx to appear in paginated address history");
     }
+    let confirmed_page_0 = test_env
+        .client()
+        .waterfalls_addresses(&vec![addr.clone()])
+        .await
+        .unwrap()
+        .0;
+    let confirmed_txs_page_0 = &confirmed_page_0.txs_seen.get("addresses").unwrap()[0];
+
+    assert_eq!(confirmed_txs_page_0.len(), 3);
+    assert_eq!(confirmed_page_0.page, 0);
+    assert_eq!(confirmed_page_0.has_more, Some(vec![addr.to_string()]));
+    assert_eq!(
+        confirmed_txs_page_0
+            .iter()
+            .map(|tx_seen| tx_seen.txid)
+            .collect::<Vec<_>>(),
+        expected_txids[..3].to_vec()
+    );
+    assert!(confirmed_txs_page_0.iter().all(|tx_seen| tx_seen.height > 0));
+
+    let result_page_1 = test_env
+        .client()
+        .waterfalls_addresses_with_page(&vec![addr.clone()], 1)
+        .await
+        .unwrap()
+        .0;
+    let txs_page_1 = &result_page_1.txs_seen.get("addresses").unwrap()[0];
+
+    assert_eq!(txs_page_1.len(), 2);
+    assert_eq!(result_page_1.page, 1);
+    assert_eq!(result_page_1.has_more, None);
+    assert!(txs_page_1.iter().any(|tx_seen| tx_seen.txid == expected_txids[3]));
+    assert!(txs_page_1.iter().any(|tx_seen| tx_seen.txid == expected_txids[4]));
+    assert!(txs_page_1.iter().all(|tx_seen| tx_seen.height > 0));
+
     let mempool_txid = test_env.send_to(&addr, 11_000);
 
     let result_page_0 = timeout(Duration::from_secs(10), async {
@@ -82,6 +147,12 @@ async fn integration_addresses_txs_seen_truncation() {
             let txs_page_0 = &result.txs_seen.get("addresses").unwrap()[0];
             if txs_page_0.len() == 4
                 && txs_page_0.iter().any(|tx_seen| tx_seen.txid == mempool_txid)
+                && txs_page_0
+                    .iter()
+                    .filter(|tx_seen| tx_seen.height == 0)
+                    .map(|tx_seen| tx_seen.txid)
+                    .collect::<Vec<_>>()
+                    == vec![mempool_txid]
             {
                 break result;
             }
@@ -107,41 +178,24 @@ async fn integration_addresses_txs_seen_truncation() {
         vec![mempool_txid]
     );
 
-    test_env.node_generate(1).await;
-
-    let result_page_1 = timeout(Duration::from_secs(10), async {
-        loop {
-            let result = test_env
-                .client()
-                .waterfalls_addresses_with_page(&vec![addr.clone()], 1)
-                .await
-                .unwrap()
-                .0;
-            let txs_page_1 = &result.txs_seen.get("addresses").unwrap()[0];
-            if txs_page_1.len() == 3
-                && txs_page_1.iter().all(|tx_seen| tx_seen.height > 0)
-                && result.has_more.is_none()
-            {
-                break result;
-            }
-            sleep(Duration::from_millis(100)).await;
-        }
-    })
-    .await
-    .expect("timed out waiting for page 1 settled confirmed history");
+    let result_page_1 = test_env
+        .client()
+        .waterfalls_addresses_with_page(&vec![addr.clone()], 1)
+        .await
+        .unwrap()
+        .0;
     let txs_page_1 = &result_page_1.txs_seen.get("addresses").unwrap()[0];
 
-    assert_eq!(txs_page_1.len(), 3);
+    assert_eq!(txs_page_1.len(), 2);
     assert_eq!(result_page_1.page, 1);
     assert_eq!(result_page_1.has_more, None);
     assert!(txs_page_1.iter().any(|tx_seen| tx_seen.txid == expected_txids[3]));
     assert!(txs_page_1.iter().any(|tx_seen| tx_seen.txid == expected_txids[4]));
-    assert!(txs_page_1.iter().any(|tx_seen| tx_seen.txid == mempool_txid));
     assert!(txs_page_1.iter().all(|tx_seen| tx_seen.height > 0));
 
     let address_txs = test_env.client().address_txs(&addr).await.unwrap();
     let address_txs: serde_json::Value = serde_json::from_str(&address_txs).unwrap();
-    assert_eq!(address_txs.as_array().unwrap().len(), 3);
+    assert_eq!(address_txs.as_array().unwrap().len(), 4);
 
     let err = test_env
         .client()
