@@ -31,10 +31,24 @@ GET /v2/waterfalls.cbor?<query_params>
   - Addresses cannot be blinded (confidential)
   
 - `page` (integer, optional): Page number for pagination (default: 0)
+  - For `descriptor`, this selects the derivation window
+  - For `addresses`, pagination is supported only when exactly one address is supplied
+  - When more than one address is supplied, `page` may be omitted or set to `0`
+  - Requests with more than one address and `page > 0` return `400`
 
 - `to_index` (integer, optional): Maximum derivation index for descriptors (default: 0)
 
 - `utxo_only` (boolean, optional): Return only unspent outputs (default: false)
+  - If any requested script has more history than the server-side truncation threshold, the request returns `400 UtxoOnlyHistoryTooLarge`
+
+**History truncation:**
+
+- To avoid unbounded responses on highly reused addresses, Waterfalls caps the number of confirmed `TxSeen` entries returned for a single script pubkey
+- The server-side cap is configurable and defaults to `100`
+- Truncation is applied independently to each script/address result
+- For `addresses=<single_address>`, clients can continue the confirmed history by increasing `page`
+- Mempool entries are included on page `0`; subsequent pages contain only confirmed history
+- Descriptor responses do not page the history of a single derived address; instead, `has_more` lists the concrete derived addresses whose history was truncated so the client can continue via the `addresses` endpoint
 
 **Response Format (JSON):**
 ```json
@@ -50,10 +64,20 @@ GET /v2/waterfalls.cbor?<query_params>
       }
     ]
   },
+  "has_more": [
+    "truncated_address_1"
+  ],
   "page": 0,
   "tip": "current_tip_hash"
 }
 ```
+
+**Response fields:**
+
+- `txs_seen`: Transaction history grouped by descriptor key or by the literal `"addresses"` key
+- `has_more` (array of strings, optional): Concrete addresses whose confirmed history was truncated on this response page
+- `page`: Echoes the requested page
+- `tip`: Current tip block hash
 
 **Differences between v1 and v2:**
 - v2 includes `tip` field in response
@@ -81,6 +105,9 @@ The v4 endpoints accept the same query parameters as v2 but return extended tip 
       }
     ]
   },
+  "has_more": [
+    "truncated_address_1"
+  ],
   "page": 0,
   "tip_meta": {
     "b": "current_tip_block_hash",
@@ -96,6 +123,7 @@ The v4 endpoints accept the same query parameters as v2 but return extended tip 
   - `b` (string): Block hash of the current tip
   - `t` (integer): Block timestamp (Unix epoch seconds)
   - `h` (integer): Block height
+- v2 and v4 both support history truncation and the optional `has_more` field
 
 ### Last Used Index
 ```
@@ -229,6 +257,11 @@ Returns transaction history for a specific address in Esplora-compatible format.
 **Parameters:**
 - `address` (string): Bitcoin/Elements address
 
+**Notes:**
+- Confirmed history is capped by the same server-side truncation threshold used by the waterfalls endpoints
+- This endpoint currently returns only the first capped page of confirmed history, plus current mempool entries
+- If an address has more history than the cap, older confirmed transactions are not returned by this endpoint
+
 **Response (JSON):**
 ```json
 [
@@ -319,6 +352,8 @@ Common error conditions:
 - `WrongNetwork`: Network mismatch (e.g., mainnet descriptor on testnet)
 - `TooManyAddresses`: Exceeds maximum address limit
 - `AddressCannotBeBlinded`: Blinded/confidential address provided
+- `AddressPageRequiresSingleAddress`: `page > 0` was used with more than one address
+- `UtxoOnlyHistoryTooLarge`: `utxo_only=true` was requested for a script whose history exceeds the truncation threshold
 - `InvalidTxid`: Malformed transaction ID
 - `InvalidBlockHash`: Malformed block hash
 - `CannotFindTx`: Transaction not found
