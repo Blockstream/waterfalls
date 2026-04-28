@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use age::x25519;
 use elements::AddressParams;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use waterfalls::Family;
 #[cfg(feature = "test_env")]
 use waterfalls::{be, fetch::Client as FetchClient, server::Arguments, server::Network};
@@ -71,19 +71,25 @@ async fn integration_addresses_txs_seen_truncation() {
     }
     let mempool_txid = test_env.send_to(&addr, 11_000);
 
-    let result_page_0 = loop {
-        let result = test_env
-            .client()
-            .waterfalls_addresses(&vec![addr.clone()])
-            .await
-            .unwrap()
-            .0;
-        let txs_page_0 = &result.txs_seen.get("addresses").unwrap()[0];
-        if txs_page_0.len() == 4 && txs_page_0.iter().any(|tx_seen| tx_seen.txid == mempool_txid) {
-            break result;
+    let result_page_0 = timeout(Duration::from_secs(10), async {
+        loop {
+            let result = test_env
+                .client()
+                .waterfalls_addresses(&vec![addr.clone()])
+                .await
+                .unwrap()
+                .0;
+            let txs_page_0 = &result.txs_seen.get("addresses").unwrap()[0];
+            if txs_page_0.len() == 4
+                && txs_page_0.iter().any(|tx_seen| tx_seen.txid == mempool_txid)
+            {
+                break result;
+            }
+            sleep(Duration::from_millis(100)).await;
         }
-        sleep(Duration::from_millis(100)).await;
-    };
+    })
+    .await
+    .expect("timed out waiting for page 0 truncated history with mempool");
     let txs_page_0 = &result_page_0.txs_seen.get("addresses").unwrap()[0];
 
     assert_eq!(txs_page_0.len(), 4);
@@ -103,22 +109,26 @@ async fn integration_addresses_txs_seen_truncation() {
 
     test_env.node_generate(1).await;
 
-    let result_page_1 = loop {
-        let result = test_env
-            .client()
-            .waterfalls_addresses_with_page(&vec![addr.clone()], 1)
-            .await
-            .unwrap()
-            .0;
-        let txs_page_1 = &result.txs_seen.get("addresses").unwrap()[0];
-        if txs_page_1.len() == 3
-            && txs_page_1.iter().all(|tx_seen| tx_seen.height > 0)
-            && result.has_more.is_none()
-        {
-            break result;
+    let result_page_1 = timeout(Duration::from_secs(10), async {
+        loop {
+            let result = test_env
+                .client()
+                .waterfalls_addresses_with_page(&vec![addr.clone()], 1)
+                .await
+                .unwrap()
+                .0;
+            let txs_page_1 = &result.txs_seen.get("addresses").unwrap()[0];
+            if txs_page_1.len() == 3
+                && txs_page_1.iter().all(|tx_seen| tx_seen.height > 0)
+                && result.has_more.is_none()
+            {
+                break result;
+            }
+            sleep(Duration::from_millis(100)).await;
         }
-        sleep(Duration::from_millis(100)).await;
-    };
+    })
+    .await
+    .expect("timed out waiting for page 1 settled confirmed history");
     let txs_page_1 = &result_page_1.txs_seen.get("addresses").unwrap()[0];
 
     assert_eq!(txs_page_1.len(), 3);
