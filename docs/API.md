@@ -49,6 +49,7 @@ GET /v2/waterfalls.cbor?<query_params>
 - For `addresses=<single_address>`, clients can continue the confirmed history by increasing `page`
 - Mempool entries are included on page `0`; subsequent pages contain only confirmed history
 - Descriptor responses do not page the history of a single derived address; instead, `has_more` lists the concrete derived addresses whose history was truncated so the client can continue via the `addresses` endpoint
+- For descriptor-derived scripts that do not have an address representation (for example bare scripts), `has_more` contains a sentinel string of the form `non_address_script:<derivation_index>`
 
 **Response Format (JSON):**
 ```json
@@ -75,7 +76,7 @@ GET /v2/waterfalls.cbor?<query_params>
 **Response fields:**
 
 - `txs_seen`: Transaction history grouped by descriptor key or by the literal `"addresses"` key
-- `has_more` (array of strings, optional): Concrete addresses whose confirmed history was truncated on this response page
+- `has_more` (array of strings, optional): Usually concrete addresses whose confirmed history was truncated on this response page. For descriptor-derived scripts without an address form, entries use the sentinel format `non_address_script:<derivation_index>`
 - `page`: Echoes the requested page
 - `tip`: Current tip block hash
 

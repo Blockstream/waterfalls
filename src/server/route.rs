@@ -648,9 +648,16 @@ async fn handle_waterfalls_req(
                     }
                     for (i, has_more_for_script) in find_result.has_more.iter().enumerate() {
                         if *has_more_for_script {
-                            let address =
-                                desc.address_at_derivation_index(batch_start + i as u32, network)?;
-                            has_more.push(address.to_string());
+                            let derivation_index = batch_start + i as u32;
+                            // TODO handle truncated non-address descriptors better. For now we
+                            // return a sentinel string instead of failing the whole request.
+                            let has_more_entry = match desc
+                                .address_at_derivation_index(derivation_index, network)
+                            {
+                                Ok(address) => address.to_string(),
+                                Err(_) => format!("non_address_script:{derivation_index}"),
+                            };
+                            has_more.push(has_more_entry);
                         }
                     }
 
