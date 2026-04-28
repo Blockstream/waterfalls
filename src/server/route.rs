@@ -673,6 +673,9 @@ async fn handle_waterfalls_req(
         }) => {
             id = string_hash(&format!("{:?}", addresses));
             utxo_only_req = utxo_only;
+            if utxo_only && page > 0 {
+                return Err(Error::UtxoOnlyHistoryTooLarge);
+            }
             let mut scripts = Vec::with_capacity(addresses.len());
             for addr in addresses.iter() {
                 scripts.push(db.hash(addr.script_pubkey().as_bytes()));

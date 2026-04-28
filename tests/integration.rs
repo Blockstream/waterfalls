@@ -143,6 +143,16 @@ async fn integration_addresses_txs_seen_truncation() {
         "waterfalls response is not 200 but: 400 body is: UtxoOnlyHistoryTooLarge"
     );
 
+    let err = test_env
+        .client()
+        .waterfalls_addresses_with_page_utxo_only(&vec![addr.clone()], Some(1), true)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        format!("{err:?}"),
+        "waterfalls response is not 200 but: 400 body is: UtxoOnlyHistoryTooLarge"
+    );
+
     test_env.shutdown().await;
 }
 
