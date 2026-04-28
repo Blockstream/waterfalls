@@ -69,44 +69,65 @@ async fn integration_addresses_txs_seen_truncation() {
         expected_txids.push(test_env.send_to(&addr, 10_000));
         test_env.node_generate(1).await;
     }
+    let mempool_txid = test_env.send_to(&addr, 11_000);
 
-    let result_page_0 = test_env
-        .client()
-        .waterfalls_addresses(&vec![addr.clone()])
-        .await
-        .unwrap()
-        .0;
+    let result_page_0 = loop {
+        let result = test_env
+            .client()
+            .waterfalls_addresses(&vec![addr.clone()])
+            .await
+            .unwrap()
+            .0;
+        let txs_page_0 = &result.txs_seen.get("addresses").unwrap()[0];
+        if txs_page_0.len() == 4 && txs_page_0.iter().any(|tx_seen| tx_seen.txid == mempool_txid) {
+            break result;
+        }
+        sleep(Duration::from_millis(100)).await;
+    };
     let txs_page_0 = &result_page_0.txs_seen.get("addresses").unwrap()[0];
 
-    assert_eq!(txs_page_0.len(), 3);
+    assert_eq!(txs_page_0.len(), 4);
     assert_eq!(result_page_0.page, 0);
     assert_eq!(result_page_0.has_more, Some(vec![addr.to_string()]));
+    assert!(txs_page_0.iter().any(|tx_seen| tx_seen.txid == expected_txids[0]));
+    assert!(txs_page_0.iter().any(|tx_seen| tx_seen.txid == expected_txids[1]));
+    assert!(txs_page_0.iter().any(|tx_seen| tx_seen.txid == mempool_txid));
     assert_eq!(
         txs_page_0
             .iter()
+            .filter(|tx_seen| tx_seen.height == 0)
             .map(|tx_seen| tx_seen.txid)
             .collect::<Vec<_>>(),
-        expected_txids[..3].to_vec()
+        vec![mempool_txid]
     );
 
-    let result_page_1 = test_env
-        .client()
-        .waterfalls_addresses_with_page(&vec![addr.clone()], 1)
-        .await
-        .unwrap()
-        .0;
+    test_env.node_generate(1).await;
+
+    let result_page_1 = loop {
+        let result = test_env
+            .client()
+            .waterfalls_addresses_with_page(&vec![addr.clone()], 1)
+            .await
+            .unwrap()
+            .0;
+        let txs_page_1 = &result.txs_seen.get("addresses").unwrap()[0];
+        if txs_page_1.len() == 3
+            && txs_page_1.iter().all(|tx_seen| tx_seen.height > 0)
+            && result.has_more.is_none()
+        {
+            break result;
+        }
+        sleep(Duration::from_millis(100)).await;
+    };
     let txs_page_1 = &result_page_1.txs_seen.get("addresses").unwrap()[0];
 
-    assert_eq!(txs_page_1.len(), 2);
+    assert_eq!(txs_page_1.len(), 3);
     assert_eq!(result_page_1.page, 1);
     assert_eq!(result_page_1.has_more, None);
-    assert_eq!(
-        txs_page_1
-            .iter()
-            .map(|tx_seen| tx_seen.txid)
-            .collect::<Vec<_>>(),
-        expected_txids[3..].to_vec()
-    );
+    assert!(txs_page_1.iter().any(|tx_seen| tx_seen.txid == expected_txids[3]));
+    assert!(txs_page_1.iter().any(|tx_seen| tx_seen.txid == expected_txids[4]));
+    assert!(txs_page_1.iter().any(|tx_seen| tx_seen.txid == mempool_txid));
+    assert!(txs_page_1.iter().all(|tx_seen| tx_seen.height > 0));
 
     let address_txs = test_env.client().address_txs(&addr).await.unwrap();
     let address_txs: serde_json::Value = serde_json::from_str(&address_txs).unwrap();

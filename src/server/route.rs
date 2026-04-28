@@ -641,7 +641,8 @@ async fn handle_waterfalls_req(
                         derive_script_hashes_batch(state, desc, batch_start, GAP_LIMIT).await;
                     derivations_duration += batch_derivations_duration;
 
-                    let find_result = find_scripts(state, db, &mut result, scripts, 0).await;
+                    let find_result =
+                        find_scripts(state, db, &mut result, scripts, 0, true).await;
                     if utxo_only && find_result.has_more.iter().any(|has_more| *has_more) {
                         return Err(Error::UtxoOnlyHistoryTooLarge);
                     }
@@ -682,7 +683,9 @@ async fn handle_waterfalls_req(
             } else {
                 0
             };
-            let find_result = find_scripts(state, db, &mut result, scripts, page).await;
+            let append_mempool = page == 0;
+            let find_result =
+                find_scripts(state, db, &mut result, scripts, page, append_mempool).await;
             if utxo_only && find_result.has_more.iter().any(|has_more| *has_more) {
                 return Err(Error::UtxoOnlyHistoryTooLarge);
             }
@@ -904,14 +907,17 @@ async fn find_scripts(
     result: &mut Vec<Vec<TxSeen>>,
     scripts: Vec<u64>,
     page: usize,
+    append_mempool: bool,
 ) -> FindScriptsResult {
     let mut seen_blockchain = db.get_history(&scripts).unwrap();
     let has_more = truncate_history_page(&mut seen_blockchain, page, state.max_txs_seen);
-    state
-        .mempool
-        .lock()
-        .await
-        .append_seen(&scripts, &mut seen_blockchain);
+    if append_mempool {
+        state
+            .mempool
+            .lock()
+            .await
+            .append_seen(&scripts, &mut seen_blockchain);
+    }
     let is_last = seen_blockchain.iter().all(|e| e.is_empty());
     result.extend(seen_blockchain);
     FindScriptsResult { is_last, has_more }
