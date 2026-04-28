@@ -906,11 +906,15 @@ async fn find_scripts(
     db: &crate::store::AnyStore,
     result: &mut Vec<Vec<TxSeen>>,
     scripts: Vec<u64>,
-    page: usize,
+    address_history_page: usize,
     append_mempool: bool,
 ) -> FindScriptsResult {
     let mut seen_blockchain = db.get_history(&scripts).unwrap();
-    let has_more = truncate_history_page(&mut seen_blockchain, page, state.max_txs_seen);
+    let has_more = truncate_history_page(
+        &mut seen_blockchain,
+        address_history_page,
+        state.max_txs_seen,
+    );
     if append_mempool {
         state
             .mempool
