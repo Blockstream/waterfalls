@@ -541,6 +541,7 @@ async fn handle_single_address(
 
     let script_hash = [db.hash(script_pubkey.as_bytes())];
     let mut seen_blockchain = db.get_history(&script_hash).unwrap();
+    // TODO add pagination for `/address/:address/txs`; for now we only return the first capped page.
     truncate_history_page(&mut seen_blockchain, 0, state.max_txs_seen);
     let mut result: Vec<_> = seen_blockchain
         .remove(0)
