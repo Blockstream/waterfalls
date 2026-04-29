@@ -81,7 +81,10 @@ async fn sync_mempool_once(
                 let tx = if let Some(tx) = cached_tx {
                     Ok(tx)
                 } else {
-                    client.tx(*new_txid, family).await
+                    client
+                        .tx(*new_txid, family)
+                        .await
+                        .map(|tx| crate::be::MempoolTx::new(&tx, |script| state.store.hash(script)))
                 };
                 match tx {
                     Ok(tx) => {

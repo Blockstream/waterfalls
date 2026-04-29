@@ -11,7 +11,7 @@ pub use block::Block;
 pub use block_header::BlockHeader;
 pub use descriptor::{bitcoin_descriptor, Descriptor};
 pub use outpoint::OutPoint;
-pub use transaction::{Input, InputRef, Output, OutputRef, Transaction, TransactionRef};
+pub use transaction::{Input, InputRef, MempoolTx, Output, OutputRef, Transaction, TransactionRef};
 pub use txid::Txid;
 
 use crate::server::Network;

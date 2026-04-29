@@ -28,7 +28,7 @@ pub struct State {
 
     pub store: AnyStore,
     pub mempool: Mutex<Mempool>,
-    pub mempool_cache: Mutex<HashMap<crate::be::Txid, crate::be::Transaction>>,
+    pub mempool_cache: Mutex<HashMap<crate::be::Txid, crate::be::MempoolTx>>,
     pub blocks_hash_ts: Mutex<Vec<(BlockHash, Timestamp)>>, // TODO should be moved into the Store, but in memory for db
 
     pub secp: Secp256k1<All>,

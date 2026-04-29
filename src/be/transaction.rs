@@ -6,6 +6,12 @@ pub enum Transaction {
     Elements(elements::Transaction),
 }
 
+#[derive(Debug, Clone)]
+pub struct MempoolTx {
+    inputs: Vec<crate::OutPoint>,
+    output_script_hashes: Vec<crate::ScriptHash>,
+}
+
 #[derive(Debug)]
 pub enum TransactionRef<'a> {
     Bitcoin(&'a bitcoin::Transaction),
@@ -38,22 +44,6 @@ impl Transaction {
         match self {
             Transaction::Bitcoin(tx) => tx.compute_txid().into(),
             Transaction::Elements(tx) => tx.txid().into(),
-        }
-    }
-
-    /// Iterator over outputs without cloning - more efficient for indexing
-    pub(crate) fn outputs_iter(&self) -> impl Iterator<Item = be::OutputRef> {
-        match self {
-            Transaction::Bitcoin(tx) => OutputIterator::Bitcoin(tx.output.iter()),
-            Transaction::Elements(tx) => OutputIterator::Elements(tx.output.iter()),
-        }
-    }
-
-    /// Iterator over inputs without cloning - more efficient for indexing
-    pub(crate) fn inputs_iter(&self) -> impl Iterator<Item = be::InputRef> {
-        match self {
-            Transaction::Bitcoin(tx) => InputIterator::Bitcoin(tx.input.iter()),
-            Transaction::Elements(tx) => InputIterator::Elements(tx.input.iter()),
         }
     }
 
@@ -93,6 +83,37 @@ impl Transaction {
     pub(crate) fn from_str(tx_hex: &str, family: be::Family) -> Result<Self, anyhow::Error> {
         let bytes = hex_simd::decode_to_vec(tx_hex.as_bytes())?;
         Self::from_bytes(&bytes, family)
+    }
+}
+
+impl MempoolTx {
+    pub(crate) fn new(tx: &Transaction, script_hash: impl Fn(&[u8]) -> crate::ScriptHash) -> Self {
+        match tx {
+            Transaction::Bitcoin(tx) => MempoolTx {
+                inputs: tx.input.iter().map(|input| input.previous_output.into()).collect(),
+                output_script_hashes: tx
+                    .output
+                    .iter()
+                    .map(|output| script_hash(output.script_pubkey.as_bytes()))
+                    .collect(),
+            },
+            Transaction::Elements(tx) => MempoolTx {
+                inputs: tx.input.iter().map(|input| input.previous_output.into()).collect(),
+                output_script_hashes: tx
+                    .output
+                    .iter()
+                    .map(|output| script_hash(output.script_pubkey.as_bytes()))
+                    .collect(),
+            },
+        }
+    }
+
+    pub(crate) fn inputs_iter(&self) -> impl Iterator<Item = crate::OutPoint> + '_ {
+        self.inputs.iter().copied()
+    }
+
+    pub(crate) fn output_script_hashes_iter(&self) -> impl Iterator<Item = crate::ScriptHash> + '_ {
+        self.output_script_hashes.iter().copied()
     }
 }
 
