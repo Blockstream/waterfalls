@@ -90,7 +90,11 @@ impl MempoolTx {
     pub(crate) fn new(tx: &Transaction, script_hash: impl Fn(&[u8]) -> crate::ScriptHash) -> Self {
         match tx {
             Transaction::Bitcoin(tx) => MempoolTx {
-                inputs: tx.input.iter().map(|input| input.previous_output.into()).collect(),
+                inputs: tx
+                    .input
+                    .iter()
+                    .map(|input| input.previous_output.into())
+                    .collect(),
                 output_script_hashes: tx
                     .output
                     .iter()
@@ -98,7 +102,11 @@ impl MempoolTx {
                     .collect(),
             },
             Transaction::Elements(tx) => MempoolTx {
-                inputs: tx.input.iter().map(|input| input.previous_output.into()).collect(),
+                inputs: tx
+                    .input
+                    .iter()
+                    .map(|input| input.previous_output.into())
+                    .collect(),
                 output_script_hashes: tx
                     .output
                     .iter()

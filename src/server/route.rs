@@ -641,8 +641,7 @@ async fn handle_waterfalls_req(
                         derive_script_hashes_batch(state, desc, batch_start, GAP_LIMIT).await;
                     derivations_duration += batch_derivations_duration;
 
-                    let find_result =
-                        find_scripts(state, db, &mut result, scripts, 0, true).await;
+                    let find_result = find_scripts(state, db, &mut result, scripts, 0, true).await;
                     if utxo_only && find_result.has_more.iter().any(|has_more| *has_more) {
                         return Err(Error::UtxoOnlyHistoryTooLarge);
                     }
@@ -651,12 +650,11 @@ async fn handle_waterfalls_req(
                             let derivation_index = batch_start + i as u32;
                             // TODO handle truncated non-address descriptors better. For now we
                             // return a sentinel string instead of failing the whole request.
-                            let has_more_entry = match desc
-                                .address_at_derivation_index(derivation_index, network)
-                            {
-                                Ok(address) => address.to_string(),
-                                Err(_) => format!("non_address_script:{derivation_index}"),
-                            };
+                            let has_more_entry =
+                                match desc.address_at_derivation_index(derivation_index, network) {
+                                    Ok(address) => address.to_string(),
+                                    Err(_) => format!("non_address_script:{derivation_index}"),
+                                };
                             has_more.push(has_more_entry);
                         }
                     }
@@ -937,7 +935,11 @@ async fn find_scripts(
     FindScriptsResult { is_last, has_more }
 }
 
-fn truncate_history_page(result: &mut [Vec<TxSeen>], page: usize, max_txs_seen: usize) -> Vec<bool> {
+fn truncate_history_page(
+    result: &mut [Vec<TxSeen>],
+    page: usize,
+    max_txs_seen: usize,
+) -> Vec<bool> {
     let start = page.saturating_mul(max_txs_seen);
     let end = start.saturating_add(max_txs_seen);
     let mut has_more = Vec::with_capacity(result.len());

@@ -65,7 +65,8 @@ async fn integration_addresses_txs_seen_truncation() {
 
     let secp = bitcoin::secp256k1::Secp256k1::new();
     let private_key = bitcoin::PrivateKey::generate(bitcoin::NetworkKind::Test);
-    let external_addr = bitcoin::Address::p2pkh(private_key.public_key(&secp), bitcoin::Network::Regtest);
+    let external_addr =
+        bitcoin::Address::p2pkh(private_key.public_key(&secp), bitcoin::Network::Regtest);
     let addr = be::Address::from_str(&external_addr.to_string(), test_env.network()).unwrap();
     let mut expected_txids = Vec::new();
     for _ in 0..5 {
@@ -117,7 +118,9 @@ async fn integration_addresses_txs_seen_truncation() {
             .collect::<Vec<_>>(),
         expected_txids[..3].to_vec()
     );
-    assert!(confirmed_txs_page_0.iter().all(|tx_seen| tx_seen.height > 0));
+    assert!(confirmed_txs_page_0
+        .iter()
+        .all(|tx_seen| tx_seen.height > 0));
 
     let result_page_1 = test_env
         .client()
@@ -130,8 +133,12 @@ async fn integration_addresses_txs_seen_truncation() {
     assert_eq!(txs_page_1.len(), 2);
     assert_eq!(result_page_1.page, 1);
     assert_eq!(result_page_1.has_more, None);
-    assert!(txs_page_1.iter().any(|tx_seen| tx_seen.txid == expected_txids[3]));
-    assert!(txs_page_1.iter().any(|tx_seen| tx_seen.txid == expected_txids[4]));
+    assert!(txs_page_1
+        .iter()
+        .any(|tx_seen| tx_seen.txid == expected_txids[3]));
+    assert!(txs_page_1
+        .iter()
+        .any(|tx_seen| tx_seen.txid == expected_txids[4]));
     assert!(txs_page_1.iter().all(|tx_seen| tx_seen.height > 0));
 
     let mempool_txid = test_env.send_to(&addr, 11_000);
@@ -146,7 +153,9 @@ async fn integration_addresses_txs_seen_truncation() {
                 .0;
             let txs_page_0 = &result.txs_seen.get("addresses").unwrap()[0];
             if txs_page_0.len() == 4
-                && txs_page_0.iter().any(|tx_seen| tx_seen.txid == mempool_txid)
+                && txs_page_0
+                    .iter()
+                    .any(|tx_seen| tx_seen.txid == mempool_txid)
                 && txs_page_0
                     .iter()
                     .filter(|tx_seen| tx_seen.height == 0)
@@ -166,9 +175,15 @@ async fn integration_addresses_txs_seen_truncation() {
     assert_eq!(txs_page_0.len(), 4);
     assert_eq!(result_page_0.page, 0);
     assert_eq!(result_page_0.has_more, Some(vec![addr.to_string()]));
-    assert!(txs_page_0.iter().any(|tx_seen| tx_seen.txid == expected_txids[0]));
-    assert!(txs_page_0.iter().any(|tx_seen| tx_seen.txid == expected_txids[1]));
-    assert!(txs_page_0.iter().any(|tx_seen| tx_seen.txid == mempool_txid));
+    assert!(txs_page_0
+        .iter()
+        .any(|tx_seen| tx_seen.txid == expected_txids[0]));
+    assert!(txs_page_0
+        .iter()
+        .any(|tx_seen| tx_seen.txid == expected_txids[1]));
+    assert!(txs_page_0
+        .iter()
+        .any(|tx_seen| tx_seen.txid == mempool_txid));
     assert_eq!(
         txs_page_0
             .iter()
@@ -189,8 +204,12 @@ async fn integration_addresses_txs_seen_truncation() {
     assert_eq!(txs_page_1.len(), 2);
     assert_eq!(result_page_1.page, 1);
     assert_eq!(result_page_1.has_more, None);
-    assert!(txs_page_1.iter().any(|tx_seen| tx_seen.txid == expected_txids[3]));
-    assert!(txs_page_1.iter().any(|tx_seen| tx_seen.txid == expected_txids[4]));
+    assert!(txs_page_1
+        .iter()
+        .any(|tx_seen| tx_seen.txid == expected_txids[3]));
+    assert!(txs_page_1
+        .iter()
+        .any(|tx_seen| tx_seen.txid == expected_txids[4]));
     assert!(txs_page_1.iter().all(|tx_seen| tx_seen.height > 0));
 
     let address_txs = test_env.client().address_txs(&addr).await.unwrap();
