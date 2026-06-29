@@ -189,12 +189,12 @@ impl DBStore {
             .collect()
     }
 
-    pub fn open(
-        path: &Path,
-        shared_db_cache_mb: u64,
-        enable_statistics: bool,
-        reorg_data_keep_heights: u32,
-    ) -> Result<Self> {
+    /// Build the database-wide options used to open the store.
+    ///
+    /// Kept separate so tests can open with the exact production options (most
+    /// importantly `atomic_flush`, see below) while layering on test-only
+    /// settings such as crash simulation.
+    fn db_options(enable_statistics: bool) -> Options {
         let mut db_opts = Options::default();
 
         // Enable statistics collection for detailed metrics including bloom filter stats
@@ -224,7 +224,19 @@ impl DBStore {
         // WAL off. It only changes flush grouping, not the write path, so the
         // cost at tip (where flushes are infrequent) is negligible; the extra
         // work falls on IBD, which is exactly when the guarantee is needed.
+        // Regression-tested by `test::atomic_flush_keeps_utxos_consistent_on_crash`.
         db_opts.set_atomic_flush(true);
+
+        db_opts
+    }
+
+    pub fn open(
+        path: &Path,
+        shared_db_cache_mb: u64,
+        enable_statistics: bool,
+        reorg_data_keep_heights: u32,
+    ) -> Result<Self> {
+        let db_opts = Self::db_options(enable_statistics);
 
         let db = rocksdb::DB::open_cf_descriptors(
             &db_opts,
@@ -1069,6 +1081,148 @@ mod test {
         assert_eq!(
             script_hashes_by_ord, script_hashes_sorted_by_encoding,
             "ScriptHash (u64) natural ordering must match binary encoding ordering"
+        );
+    }
+
+    /// Copy the on-disk files of a RocksDB directory into `dst`.
+    ///
+    /// The result is the state that would survive an ungraceful crash: only data
+    /// already flushed to disk is captured, anything still in a memtable is lost.
+    /// (A RocksDB directory is flat — CURRENT, MANIFEST, OPTIONS, *.sst, etc.)
+    fn snapshot_on_disk_state(src: &std::path::Path, dst: &std::path::Path) {
+        for entry in std::fs::read_dir(src).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                std::fs::copy(entry.path(), dst.join(entry.file_name())).unwrap();
+            }
+        }
+    }
+
+    /// Regression test for the "every utxo must exist when spent" corruption.
+    ///
+    /// During IBD the WAL is disabled (see `write`). A block update writes the
+    /// UTXO set and the block-height marker in a single batch, but those land in
+    /// separate column families, which RocksDB flushes independently. If the
+    /// process is killed after the height marker's memtable is flushed but
+    /// before the UTXO's is, the persisted state has a height ahead of its
+    /// UTXOs. On restart the first spend of the missing UTXO panics, and the
+    /// node crash-loops forever with no way to self-heal.
+    ///
+    /// `atomic_flush` (set in `db_options`) makes those background flushes
+    /// atomic across families, so the persisted state is always a consistent
+    /// prefix. We reproduce a hard crash by snapshotting the on-disk directory
+    /// the moment the background flush lands — before any clean-shutdown flush
+    /// could mask the bug — and reopening from the snapshot. Remove
+    /// `set_atomic_flush(true)` and this test fails: the UTXO is gone after the
+    /// simulated crash, exactly the production failure.
+    ///
+    /// Note: the flush has to be the automatic (memtable-pressure) one — a
+    /// manual single-family flush does not co-flush other families even with
+    /// atomic_flush — so we give the families a tiny write buffer and write
+    /// enough height markers to force background flushes.
+    #[test]
+    fn atomic_flush_keeps_utxos_consistent_on_crash() {
+        use crate::store::BlockMeta;
+        use std::sync::atomic::AtomicBool;
+
+        let _ = env_logger::try_init();
+
+        let live = tempfile::TempDir::new().unwrap();
+        let crashed = tempfile::TempDir::new().unwrap();
+
+        let outpoint = {
+            let mut o = OutPoint::null();
+            o.vout = 6;
+            o
+        };
+        let script_hash: u64 = 777;
+
+        {
+            // Production DB options — crucially `atomic_flush`, from `db_options`,
+            // which is the line under test. The per-family write buffers are sized
+            // tiny here so writes trigger real background flushes (the path
+            // atomic_flush governs); that only controls *when* flushes happen, not
+            // their cross-family atomicity.
+            let db_opts = DBStore::db_options(false);
+            let cf_descriptors: Vec<_> = super::COLUMN_FAMILIES
+                .iter()
+                .map(|&name| {
+                    let mut cf_opts = rocksdb::Options::default();
+                    cf_opts.set_write_buffer_size(16 * 1024);
+                    cf_opts.set_max_write_buffer_number(2);
+                    rocksdb::ColumnFamilyDescriptor::new(name, cf_opts)
+                })
+                .collect();
+            let db = DBStore {
+                db: rocksdb::DB::open_cf_descriptors(&db_opts, live.path(), cf_descriptors)
+                    .unwrap(),
+                salt: 0,
+                ibd: AtomicBool::new(true), // IBD => writes skip the WAL
+                reorg_data_keep_heights: 6,
+            };
+
+            // An earlier block creates the UTXO (utxo CF), WAL-off.
+            let created: BTreeMap<_, _> = [(outpoint, script_hash)].into_iter().collect();
+            let mut batch = rocksdb::WriteBatch::default();
+            db.insert_utxos(&mut batch, &created).unwrap();
+            db.write(batch).unwrap();
+
+            // Later blocks advance the height marker (hashes CF), WAL-off,
+            // written in many small batches. With the tiny write buffer this
+            // overflows the memtable and triggers background flushes. (A single
+            // oversized batch does not — RocksDB only re-checks the flush
+            // condition on a subsequent write — so the writes must be chunked,
+            // which also matches how blocks are indexed one at a time.) Under
+            // atomic_flush the first such flush also persists the single UTXO;
+            // without it, the UTXO is left behind in its own memtable, which
+            // never fills because it holds one entry.
+            for chunk in 0..40u32 {
+                let mut batch = rocksdb::WriteBatch::default();
+                for i in 0..500u32 {
+                    let height = chunk * 500 + i + 1;
+                    let meta = BlockMeta::new(height, BlockHash::all_zeros(), 0);
+                    db.set_hash_ts_batch(&mut batch, &meta);
+                }
+                db.write(batch).unwrap();
+            }
+
+            // Wait (bounded) for the height-marker CF to flush to disk. Under
+            // atomic_flush the UTXO CF is flushed in the same atomic step, so this
+            // is also the barrier for the UTXO.
+            let hashes_cf = db.db.cf_handle(super::HASHES_CF).unwrap();
+            let mut flushed = false;
+            for _ in 0..400 {
+                let l0 = db
+                    .db
+                    .property_int_value_cf(&hashes_cf, "rocksdb.num-files-at-level0")
+                    .unwrap()
+                    .unwrap_or(0);
+                if l0 > 0 {
+                    flushed = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            assert!(
+                flushed,
+                "test setup: height-marker CF never flushed; raise the write count \
+                 or lower the write buffer size",
+            );
+
+            // Capture the on-disk state == what survives an ungraceful crash,
+            // before the clean drop below flushes everything and masks the bug.
+            snapshot_on_disk_state(live.path(), crashed.path());
+        }
+
+        // Reopen from the crashed snapshot and verify the UTXO survived.
+        let recovered = DBStore::open(crashed.path(), 64, false, 6).unwrap();
+        let found = recovered.get_utxos(&[outpoint]).unwrap();
+        assert_eq!(
+            found,
+            vec![Some(script_hash)],
+            "a UTXO created before the last persisted height marker must survive a \
+             crash during IBD; without atomic_flush it is lost, which is the \
+             unrecoverable 'every utxo must exist when spent' corruption",
         );
     }
 }
