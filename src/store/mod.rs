@@ -60,6 +60,14 @@ pub trait Store {
 
     /// Called when the initial block download is finished
     fn ibd_finished(&self);
+
+    /// Durably flush in-memory data to disk.
+    ///
+    /// Matters while the WAL is disabled during IBD: an explicit flush on
+    /// graceful shutdown persists sync progress that would otherwise be dropped
+    /// if the process exits before the next automatic flush. A no-op for stores
+    /// without persistent backing.
+    fn flush(&self);
 }
 
 impl Store for AnyStore {
@@ -130,6 +138,14 @@ impl Store for AnyStore {
             #[cfg(feature = "db")]
             AnyStore::Db(d) => d.ibd_finished(),
             AnyStore::Mem(m) => m.ibd_finished(),
+        }
+    }
+
+    fn flush(&self) {
+        match self {
+            #[cfg(feature = "db")]
+            AnyStore::Db(d) => d.flush(),
+            AnyStore::Mem(m) => m.flush(),
         }
     }
 }

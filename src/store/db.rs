@@ -108,6 +108,22 @@ impl DBStore {
         Ok(reordered)
     }
 
+    /// Flush every column-family memtable to SST files.
+    ///
+    /// With `atomic_flush` enabled at open (see `open`), this produces a
+    /// crash-consistent on-disk checkpoint across all column families even while
+    /// the WAL is disabled during IBD. Called when IBD finishes and on graceful
+    /// shutdown so that sync progress is not lost on a clean restart.
+    fn flush_all_cfs(&self) {
+        for cf_name in COLUMN_FAMILIES {
+            if let Some(cf) = self.db.cf_handle(cf_name) {
+                self.db
+                    .flush_cf(&cf)
+                    .unwrap_or_else(|e| log::error!("failed to flush CF {cf_name}: {e}"));
+            }
+        }
+    }
+
     fn create_cf_descriptors(shared_db_cache_mb: u64) -> Vec<rocksdb::ColumnFamilyDescriptor> {
         let cache_size = (shared_db_cache_mb * 1024 * 1024) as usize;
         // HyperClockCache is lock-free, reducing mutex contention under concurrent reads.
@@ -194,6 +210,21 @@ impl DBStore {
         log::info!("Setting RocksDB parallelism to {} threads", parallelism);
         db_opts.increase_parallelism(parallelism);
         db_opts.set_max_background_jobs(parallelism);
+
+        // The WAL is disabled during IBD (see `write`) to speed up the initial
+        // sync. A single block update is one WriteBatch spanning several column
+        // families (utxos, history, block hash/height). Without the WAL each
+        // column family flushes its memtable to disk independently, so a hard
+        // crash mid-sync (OOM, SIGKILL, host loss) can persist some families
+        // ahead of others — e.g. the block-height marker advances while a UTXO
+        // that a later block spends was never flushed. On restart that surfaces
+        // as a fatal "every utxo must exist when spent" and an unrecoverable
+        // crash loop. `atomic_flush` makes multi-family flushes atomic, so the
+        // recovered on-disk state is always a consistent prefix even with the
+        // WAL off. It only changes flush grouping, not the write path, so the
+        // cost at tip (where flushes are infrequent) is negligible; the extra
+        // work falls on IBD, which is exactly when the guarantee is needed.
+        db_opts.set_atomic_flush(true);
 
         let db = rocksdb::DB::open_cf_descriptors(
             &db_opts,
@@ -728,15 +759,13 @@ impl Store for DBStore {
 
     fn ibd_finished(&self) {
         log::info!("Initial block download finished, flushing memtables before enabling WAL...");
-        for cf_name in COLUMN_FAMILIES {
-            if let Some(cf) = self.db.cf_handle(cf_name) {
-                self.db
-                    .flush_cf(&cf)
-                    .unwrap_or_else(|e| log::error!("failed to flush CF {cf_name}: {e}"));
-            }
-        }
+        self.flush_all_cfs();
         log::info!("Memtables flushed, setting ibd to false");
         self.ibd.store(false, Ordering::Relaxed);
+    }
+
+    fn flush(&self) {
+        self.flush_all_cfs();
     }
 }
 

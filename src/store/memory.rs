@@ -120,6 +120,8 @@ impl Store for MemoryStore {
     }
 
     fn ibd_finished(&self) {}
+
+    fn flush(&self) {}
 }
 
 impl MemoryStore {

@@ -11,6 +11,7 @@ use crate::inc_connection_error_counter;
 use crate::server::preload::headers;
 use crate::store::memory::MemoryStore;
 use crate::store::AnyStore;
+use crate::store::Store;
 use crate::threads::blocks::blocks_infallible;
 use crate::threads::mempool::mempool_sync_infallible;
 use crate::threads::zmq::rawtx_listener_infallible;
@@ -631,6 +632,13 @@ pub async fn inner_main(
         h3.await.unwrap();
     }
     h4.await.unwrap();
+
+    // Background writers have stopped, so persist any buffered data before
+    // exiting. While the WAL is disabled during IBD, un-flushed memtables would
+    // otherwise be dropped on process exit, losing sync progress (and, without
+    // atomic_flush, risking an inconsistent on-disk state). Cheap at tip where
+    // memtables are nearly empty.
+    state.store.flush();
 
     log::info!("shutting down gracefully");
     Ok(())
