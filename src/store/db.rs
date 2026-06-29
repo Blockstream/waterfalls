@@ -1225,4 +1225,129 @@ mod test {
              unrecoverable 'every utxo must exist when spent' corruption",
         );
     }
+
+    /// Benchmark the cost of `atomic_flush` on the IBD write path (WAL off).
+    ///
+    /// Replays a synthetic initial sync — many blocks, each creating UTXOs and
+    /// history entries — through the real `update` path, with `atomic_flush`
+    /// off then on, and prints wall-clock time plus flush/compaction bytes
+    /// (write amplification). Production column-family settings (default 64 MiB
+    /// write buffers) so the numbers reflect a real sync, not a worst case.
+    ///
+    /// Run: `cargo test --release --lib bench_ibd_atomic_flush -- --ignored --nocapture`
+    /// Scale with env vars `BENCH_BLOCKS` / `BENCH_CREATES_PER_BLOCK`.
+    #[test]
+    #[ignore = "benchmark; run with --release --ignored --nocapture"]
+    fn bench_ibd_atomic_flush() {
+        use crate::store::BlockMeta;
+        use std::sync::atomic::AtomicBool;
+        use std::time::Instant;
+
+        let env_u64 = |k: &str, d: u64| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
+        let blocks: u32 = env_u64("BENCH_BLOCKS", 3_000) as u32;
+        let creates: u32 = env_u64("BENCH_CREATES_PER_BLOCK", 2_000) as u32;
+        // 0 = production default (64 MiB) buffers. Set small (e.g. 256) to force
+        // frequent flushes and expose the worst-case atomic_flush overhead.
+        let write_buf_kib: u64 = env_u64("BENCH_WRITE_BUFFER_KIB", 0);
+        let txid = crate::be::Txid::all_zeros();
+
+        // Pull a ticker count out of the RocksDB statistics dump.
+        let ticker = |stats: &str, key: &str| -> u64 {
+            let needle = format!("{key} ");
+            stats
+                .lines()
+                .find(|l| l.trim_start().starts_with(&needle))
+                .and_then(|l| l.rsplit(':').next())
+                .and_then(|n| n.trim().parse().ok())
+                .unwrap_or(0)
+        };
+
+        let buf_desc = if write_buf_kib == 0 {
+            "64MiB buffers".to_string()
+        } else {
+            format!("{write_buf_kib}KiB buffers")
+        };
+        println!(
+            "\nIBD bench: {blocks} blocks x {creates} creates = {} UTXO writes (WAL off, {buf_desc})",
+            blocks as u64 * creates as u64,
+        );
+        println!(
+            "{:<14}{:>12}{:>14}{:>14}{:>16}",
+            "atomic_flush", "elapsed_s", "flush_MiB", "compact_MiB", "writes/s"
+        );
+
+        for atomic in [false, true] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let mut db_opts = DBStore::db_options(false);
+            db_opts.set_atomic_flush(atomic);
+            db_opts.enable_statistics();
+            let cf_descriptors = if write_buf_kib == 0 {
+                DBStore::create_cf_descriptors(64)
+            } else {
+                super::COLUMN_FAMILIES
+                    .iter()
+                    .map(|&name| {
+                        let mut cf_opts = rocksdb::Options::default();
+                        cf_opts.set_write_buffer_size(write_buf_kib as usize * 1024);
+                        // history CF is written via merge; it needs the operator.
+                        if name == super::HISTORY_CF {
+                            cf_opts.set_merge_operator_associative(
+                                "concat_merge",
+                                super::concat_merge,
+                            );
+                        }
+                        rocksdb::ColumnFamilyDescriptor::new(name, cf_opts)
+                    })
+                    .collect()
+            };
+            let db = DBStore {
+                db: rocksdb::DB::open_cf_descriptors(&db_opts, dir.path(), cf_descriptors).unwrap(),
+                salt: 0,
+                ibd: AtomicBool::new(true), // IBD => WAL off, the path under test
+                reorg_data_keep_heights: 6,
+            };
+
+            let mut vout = 0u32;
+            let start = Instant::now();
+            for height in 1..=blocks {
+                let mut created = BTreeMap::new();
+                let mut history = BTreeMap::new();
+                for _ in 0..creates {
+                    let mut o = OutPoint::null();
+                    o.vout = vout;
+                    let sh = vout as u64;
+                    created.insert(o, sh);
+                    history.insert(sh, vec![TxSeen::new(txid, height, V::Vout(vout))]);
+                    vout = vout.wrapping_add(1);
+                }
+                db.update(
+                    &BlockMeta::new(height, BlockHash::all_zeros(), height),
+                    vec![],
+                    history,
+                    created,
+                )
+                .unwrap();
+            }
+            // Flush remaining memtables, as production does when IBD finishes.
+            db.flush();
+            let elapsed = start.elapsed();
+
+            let stats = db_opts.get_statistics().unwrap_or_default();
+            let mib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
+            let total_writes = blocks as f64 * creates as f64;
+            println!(
+                "{:<14}{:>12.2}{:>14.1}{:>14.1}{:>16.0}",
+                atomic,
+                elapsed.as_secs_f64(),
+                mib(ticker(&stats, "rocksdb.flush.write.bytes")),
+                mib(ticker(&stats, "rocksdb.compact.write.bytes")),
+                total_writes / elapsed.as_secs_f64(),
+            );
+        }
+    }
 }
