@@ -724,16 +724,14 @@ async fn handle_waterfalls_req(
                         derive_script_hashes_batch(state, desc, batch_start, GAP_LIMIT).await;
                     derivations_duration += batch_derivations_duration;
 
-                    let find_result = find_scripts(state, db, &mut result, scripts, 0, true).await;
+                    let find_result =
+                        find_scripts(state, db, &mut result, scripts, 0, true, !utxo_only).await;
                     let max_used_index = find_result
                         .max_used_offset
                         .map(|offset| batch_start + offset);
                     state
                         .record_descriptor_scan_max_used_index(single_descriptor_id, max_used_index)
                         .await;
-                    if utxo_only && find_result.has_more.iter().any(|has_more| *has_more) {
-                        return Err(Error::UtxoOnlyHistoryTooLarge);
-                    }
                     for (i, has_more_for_script) in find_result.has_more.iter().enumerate() {
                         if *has_more_for_script {
                             let derivation_index = batch_start + i as u32;
@@ -756,6 +754,7 @@ async fn handle_waterfalls_req(
                 }
                 if utxo_only {
                     filter_utxo_only(&mut result, db)?;
+                    enforce_utxo_only_cap(&result, state.max_txs_seen)?;
                 }
                 map.insert(desc.to_string(), result);
             }
@@ -781,13 +780,19 @@ async fn handle_waterfalls_req(
                 0
             };
             let append_mempool = page == 0;
-            let find_result =
-                find_scripts(state, db, &mut result, scripts, page, append_mempool).await;
-            if utxo_only && find_result.has_more.iter().any(|has_more| *has_more) {
-                return Err(Error::UtxoOnlyHistoryTooLarge);
-            }
+            let find_result = find_scripts(
+                state,
+                db,
+                &mut result,
+                scripts,
+                page,
+                append_mempool,
+                !utxo_only,
+            )
+            .await;
             if utxo_only {
                 filter_utxo_only(&mut result, db)?;
+                enforce_utxo_only_cap(&result, state.max_txs_seen)?;
             }
             for (addr, has_more_for_addr) in addresses.iter().zip(find_result.has_more.iter()) {
                 if *has_more_for_addr {
@@ -1011,6 +1016,16 @@ fn filter_utxo_only(result: &mut [Vec<TxSeen>], db: &crate::store::AnyStore) -> 
     Ok(())
 }
 
+/// Cap on the *filtered* (unspent) result, applied instead of capping the raw history count.
+/// A script only trips this if it genuinely has more than `max_txs_seen` live UTXOs at once,
+/// not merely a long history of already-spent transactions.
+fn enforce_utxo_only_cap(result: &[Vec<TxSeen>], max_txs_seen: usize) -> Result<(), Error> {
+    if result.iter().any(|txs| txs.len() > max_txs_seen) {
+        return Err(Error::UtxoOnlyHistoryTooLarge);
+    }
+    Ok(())
+}
+
 async fn handle_subscribe_req(
     state: &Arc<State>,
     descriptor: be::Descriptor,
@@ -1058,7 +1073,8 @@ async fn scan_descriptor_max_used_index(state: &Arc<State>, desc: &be::Descripto
         let (scripts, _) = derive_script_hashes_batch(state, desc, batch_start, GAP_LIMIT).await;
 
         let mut result = Vec::with_capacity(GAP_LIMIT as usize);
-        let find_result = find_scripts(state, &state.store, &mut result, scripts, 0, true).await;
+        let find_result =
+            find_scripts(state, &state.store, &mut result, scripts, 0, true, true).await;
         if let Some(max_used_offset) = find_result.max_used_offset {
             max_used_index = Some(batch_start + max_used_offset);
         }
@@ -1224,13 +1240,18 @@ async fn find_scripts(
     scripts: Vec<u64>,
     address_history_page: usize,
     append_mempool: bool,
+    truncate: bool,
 ) -> FindScriptsResult {
     let mut seen_blockchain = db.get_history(&scripts).unwrap();
-    let has_more = truncate_history_page(
-        &mut seen_blockchain,
-        address_history_page,
-        state.max_txs_seen,
-    );
+    // `utxo_only` callers pass `truncate: false`: truncating the raw history here (before
+    // `filter_utxo_only` runs) can drop the origin tx of an output that is still unspent,
+    // silently omitting a real UTXO. Those callers cap on the *filtered* unspent count
+    // afterwards instead (see `enforce_utxo_only_cap`).
+    let has_more = if truncate {
+        truncate_history_page(&mut seen_blockchain, address_history_page, state.max_txs_seen)
+    } else {
+        vec![false; seen_blockchain.len()]
+    };
     if append_mempool {
         state
             .mempool
