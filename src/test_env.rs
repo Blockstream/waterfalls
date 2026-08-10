@@ -122,6 +122,7 @@ async fn inner_launch_with_node_no_generate(
         cache_control_seconds: 0,
         request_timeout_seconds: 10,
         header_read_timeout_seconds: 10,
+        add_cors: true,
         ..Default::default()
     };
     let available_port = get_available_port().unwrap();
@@ -371,6 +372,39 @@ impl TestEnv {
 
     pub fn create_other_wallet(&self) -> Client {
         self.node.create_wallet("other_wallet").unwrap()
+    }
+
+    /// Like [`Self::blind_raw_transanction`] but against an arbitrary wallet client, needed when
+    /// the inputs being spent belong to a wallet other than the node's default one.
+    pub fn blind_raw_transanction_with(
+        &self,
+        client: &Client,
+        tx: &elements::Transaction,
+    ) -> elements::Transaction {
+        let hex = serialize_hex(tx);
+        let val = client
+            .call::<Value>(
+                "blindrawtransaction",
+                &[serde_json::Value::String(hex), false.into()],
+            )
+            .unwrap();
+        let tx_hex = val.as_str().unwrap();
+        let bytes = hex_simd::decode_to_vec(tx_hex.as_bytes()).unwrap();
+        elements::Transaction::consensus_decode(&bytes[..]).unwrap()
+    }
+
+    /// Like [`Self::sign_raw_transanction_with_wallet`] but against an arbitrary wallet client,
+    /// needed when the inputs being spent belong to a wallet other than the node's default one.
+    pub fn sign_raw_transanction_with(&self, client: &Client, tx: &be::Transaction) -> be::Transaction {
+        let hex = tx.serialize_hex();
+        let val = client
+            .call::<Value>(
+                "signrawtransactionwithwallet",
+                &[serde_json::Value::String(hex)],
+            )
+            .unwrap();
+        let tx_hex = val.get("hex").unwrap().as_str().unwrap();
+        be::Transaction::from_str(tx_hex, self.family).unwrap()
     }
 
     pub fn sign_raw_transanction_with_wallet(&self, tx: &be::Transaction) -> be::Transaction {

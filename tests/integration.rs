@@ -243,6 +243,133 @@ async fn integration_addresses_txs_seen_truncation() {
     test_env.shutdown().await;
 }
 
+/// Reproduces the `UtxoOnlyHistoryTooLarge` bug reported against a reused testnet address
+/// (Jade sending >100 txs from one address hit this against the real deployment).
+///
+/// Before the fix: `find_scripts` truncated the raw history to `max_txs_seen` entries BEFORE
+/// `filter_utxo_only` ran, so a script with more raw history than the cap always errored, even
+/// if almost everything in that raw history was already spent and only a couple of outputs were
+/// genuinely still unspent.
+///
+/// After the fix: truncation is skipped for `utxo_only` requests, `filter_utxo_only` runs on the
+/// full history, and the cap is enforced on the *filtered* (unspent) count instead. A reused
+/// address with lots of history but few live UTXOs should now succeed; an address with genuinely
+/// more live UTXOs than the cap should still be rejected (the DoS protection is preserved, just
+/// aimed at the right metric).
+#[cfg(feature = "test_env")]
+#[tokio::test]
+async fn integration_utxo_only_reused_address_with_spends() {
+    let _ = env_logger::try_init();
+
+    let exe = std::env::var("ELEMENTSD_EXEC").unwrap();
+    #[cfg(feature = "db")]
+    let test_env =
+        waterfalls::test_env::launch_with_max_txs_seen(exe, None, Family::Elements, 3).await;
+    #[cfg(not(feature = "db"))]
+    let test_env = waterfalls::test_env::launch_with_max_txs_seen(exe, Family::Elements, 3).await;
+
+    // Use an isolated wallet for the target address: the node's default-wallet coin selection
+    // (which `test_env.send_to` draws from) would otherwise happily re-spend an earlier deposit
+    // as an input for a later one, since both live in the same wallet.
+    let other_wallet = test_env.create_other_wallet();
+    let addr = get_new_address(&other_wallet, test_env.network());
+    // The `addresses=` waterfalls endpoint rejects confidential (blinded) addresses.
+    let addr = addr.to_unconfidential().unwrap_or(addr);
+
+    // 5 separate deposits to the same address; max_txs_seen is 3, so the raw history already
+    // exceeds the cap after the 4th deposit.
+    let mut deposit_txids = Vec::new();
+    for _ in 0..5 {
+        let txid = test_env.send_to(&addr, 10_000);
+        deposit_txids.push(txid);
+        test_env.node_generate(1).await;
+    }
+
+    let unspent: Vec<waterfalls::test_env::Input> = {
+        use bitcoind::bitcoincore_rpc::RpcApi;
+        let val: serde_json::Value = other_wallet.call("listunspent", &[]).unwrap();
+        serde_json::from_value(val).unwrap()
+    };
+    assert_eq!(
+        unspent.len(),
+        5,
+        "other_wallet should hold exactly the 5 isolated deposits"
+    );
+
+    // Sweep 4 of the 5 deposits into two fresh addresses in a single tx, leaving exactly one
+    // live UTXO at `addr`. Elements blinding needs at least 2 blinded outputs to balance, hence
+    // the split instead of a single change output.
+    let (spend, keep) = unspent.split_at(4);
+    let spent_amount: f64 = spend.iter().map(|i| i.amount).sum();
+    let net_amount = spent_amount - 0.00001;
+    let change_a = get_new_address(&other_wallet, test_env.network());
+    let change_b = get_new_address(&other_wallet, test_env.network());
+    let tx = {
+        use bitcoind::bitcoincore_rpc::RpcApi;
+        let inputs_json = serde_json::to_value(spend).unwrap();
+        let half = net_amount / 2.0;
+        let outputs_json = serde_json::json!([
+            { change_a.to_string(): half },
+            { change_b.to_string(): net_amount - half },
+            { "fee": 0.00001 },
+        ]);
+        let tx_hex: String = other_wallet
+            .call("createrawtransaction", &[inputs_json, outputs_json])
+            .unwrap();
+        use elements::encode::Decodable;
+        let bytes = hex_simd::decode_to_vec(tx_hex.as_bytes()).unwrap();
+        be::Transaction::Elements(elements::Transaction::consensus_decode(&bytes[..]).unwrap())
+    };
+    let tx = match tx {
+        be::Transaction::Bitcoin(tx) => be::Transaction::Bitcoin(tx),
+        be::Transaction::Elements(tx) => be::Transaction::Elements(
+            test_env.blind_raw_transanction_with(&other_wallet, &tx),
+        ),
+    };
+    let signed_tx = test_env.sign_raw_transanction_with(&other_wallet, &tx);
+    test_env.client().broadcast(&signed_tx).await.unwrap();
+    test_env.node_generate(1).await;
+
+    // `addr` now has 5 receive entries + at least 1 spend-reference entry in its raw history,
+    // above the cap of 3, but only 1 genuinely unspent output.
+    let (result, _) = test_env
+        .client()
+        .waterfalls_addresses_utxo_only(&[addr.clone()], true)
+        .await
+        .expect(
+            "utxo_only request should succeed: cap must apply to the unspent count, not the raw history count",
+        );
+
+    let utxo_only_txs = &result.txs_seen.get("addresses").unwrap()[0];
+    assert_eq!(
+        utxo_only_txs.len(),
+        1,
+        "expected exactly the one still-unspent deposit to survive filtering, got {utxo_only_txs:?}"
+    );
+    assert_eq!(utxo_only_txs[0].txid.to_string(), keep[0].txid);
+
+    // Sanity check the cap still protects against a genuinely oversized *unspent* set: 4 live
+    // UTXOs on one address, cap is 3, none of them spent. Same isolated-wallet address, again to
+    // stop the default wallet's coin selection from touching its own earlier deposits.
+    let addr_b = get_new_address(&other_wallet, test_env.network());
+    let addr_b = addr_b.to_unconfidential().unwrap_or(addr_b);
+    for _ in 0..4 {
+        test_env.send_to(&addr_b, 10_000);
+        test_env.node_generate(1).await;
+    }
+    let err = test_env
+        .client()
+        .waterfalls_addresses_utxo_only(&[addr_b.clone()], true)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        format!("{err:?}"),
+        "waterfalls response is not 200 but: 400 body is: UtxoOnlyHistoryTooLarge"
+    );
+
+    test_env.shutdown().await;
+}
+
 #[cfg(feature = "test_env")]
 #[tokio::test]
 async fn integration_descriptor_has_more_contains_addresses() {
@@ -2127,5 +2254,28 @@ async fn test_waterfalls_descriptor_vs_addresses() {
             resp.txs_seen.get(&descriptor.to_string()).unwrap(),
             resp2.txs_seen.get("addresses").unwrap(),
         );
+    }
+}
+
+/// Not a real test: starts a long-lived regtest node + patched waterfalls server for manual
+/// verification against a real frontend (`cargo test --features test_env -- --ignored
+/// manual_persistent_server --nocapture`). Runs until killed.
+#[cfg(feature = "test_env")]
+#[tokio::test]
+#[ignore]
+async fn manual_persistent_server() {
+    let _ = env_logger::try_init();
+
+    let exe = std::env::var("ELEMENTSD_EXEC").unwrap();
+    #[cfg(feature = "db")]
+    let test_env = waterfalls::test_env::launch(exe, None, Family::Elements).await;
+    #[cfg(not(feature = "db"))]
+    let test_env = waterfalls::test_env::launch(exe, Family::Elements).await;
+
+    println!("WATERFALLS_BASE_URL={}", test_env.base_url());
+    println!("NETWORK={:?}", test_env.network());
+
+    loop {
+        tokio::time::sleep(Duration::from_secs(3600)).await;
     }
 }
