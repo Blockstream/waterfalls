@@ -1,8 +1,9 @@
 use std::convert::Infallible;
 
-use crate::server::{Error, Network};
 use elements_miniscript::TranslatePk as ElementsTranslatePk;
 use miniscript::{ForEachKey, TranslatePk as BitcoinTranslatePk};
+
+use crate::server::{Error, Network};
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Descriptor {
@@ -64,6 +65,11 @@ impl Descriptor {
     }
 
     pub(crate) fn script_pubkey_at_derivation_index(&self, index: u32) -> Result<Vec<u8>, Error> {
+        // Elements can panic when deriving a hardened wildcard instead of returning an error.
+        if self.has_hardened_wildcard() {
+            log::error!("descriptor contains a hardened wildcard");
+            return Err(Error::HardenedWildcard);
+        }
         Ok(match self {
             Descriptor::Bitcoin(desc) => desc
                 .at_derivation_index(index)
@@ -95,6 +101,29 @@ impl Descriptor {
         match self {
             Descriptor::Bitcoin(desc) => desc.has_wildcard(),
             Descriptor::Elements(desc) => desc.has_wildcard(),
+        }
+    }
+
+    pub(crate) fn has_hardened_wildcard(&self) -> bool {
+        match self {
+            Descriptor::Bitcoin(desc) => !desc.for_each_key(|key| match key {
+                miniscript::DescriptorPublicKey::XPub(key) => {
+                    key.wildcard != miniscript::descriptor::Wildcard::Hardened
+                }
+                miniscript::DescriptorPublicKey::MultiXPub(key) => {
+                    key.wildcard != miniscript::descriptor::Wildcard::Hardened
+                }
+                miniscript::DescriptorPublicKey::Single(_) => true,
+            }),
+            Descriptor::Elements(desc) => !desc.for_each_key(|key| match key {
+                elements_miniscript::DescriptorPublicKey::XPub(key) => {
+                    key.wildcard != elements_miniscript::descriptor::Wildcard::Hardened
+                }
+                elements_miniscript::DescriptorPublicKey::MultiXPub(key) => {
+                    key.wildcard != elements_miniscript::descriptor::Wildcard::Hardened
+                }
+                elements_miniscript::DescriptorPublicKey::Single(_) => true,
+            }),
         }
     }
 

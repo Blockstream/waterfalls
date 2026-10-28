@@ -52,6 +52,11 @@ const GAP_LIMIT: u32 = 20;
 const MAX_BATCH: u32 = 50;
 const MAX_ADDRESSES: u32 = GAP_LIMIT * MAX_BATCH;
 const MAX_ADDRESS_LENGTH: usize = 100; // max characters for an address (excessive to be conservative)
+
+// Allows large multisig descriptors with many xpubs and key origins, while bounding parsing work.
+const MAX_DESCRIPTOR_LENGTH: usize = 8192;
+// Normal wallets use one path or two via <0;1>; allow some additional paths while bounding scans.
+const MAX_SINGLE_DESCRIPTORS: usize = 8;
 const MAX_TX_BODY_SIZE: usize = 1024 * 1024; // 1MB limit for transaction broadcast body
 const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30); // timeout for reading request body
 const FEE_ESTIMATES_TTL: u32 = 30; // cache fee estimates for 30 seconds
@@ -412,7 +417,7 @@ fn parse_query(
                 desc_str
             };
 
-            let descriptor = be::Descriptor::from_str(&desc_str, network)?;
+            let descriptor = parse_bounded_descriptor(&desc_str, network)?;
 
             if is_testnet_or_regtest == descriptor.is_mainnet() {
                 return Err(Error::WrongNetwork);
@@ -475,7 +480,7 @@ fn parse_descriptor_query(
         desc_str
     };
 
-    let descriptor = be::Descriptor::from_str(&desc_str, network)?;
+    let descriptor = parse_bounded_descriptor(&desc_str, network)?;
 
     if !descriptor.has_wildcard() {
         return Err(Error::DescriptorMustHaveWildcard);
@@ -485,6 +490,27 @@ fn parse_descriptor_query(
         return Err(Error::WrongNetwork);
     }
 
+    Ok(descriptor)
+}
+
+fn parse_bounded_descriptor(desc_str: &str, network: Network) -> Result<be::Descriptor, Error> {
+    if desc_str.chars().take(MAX_DESCRIPTOR_LENGTH + 1).count() > MAX_DESCRIPTOR_LENGTH {
+        log::error!("descriptor exceeds {MAX_DESCRIPTOR_LENGTH} characters");
+        return Err(Error::DescriptorTooLong);
+    }
+
+    let descriptor = be::Descriptor::from_str(desc_str, network)?;
+    let single_descriptors = descriptor.clone().into_single_descriptors()?;
+    if single_descriptors.len() > MAX_SINGLE_DESCRIPTORS {
+        log::error!("descriptor exceeds {MAX_SINGLE_DESCRIPTORS} single descriptors");
+        return Err(Error::TooManySingleDescriptors);
+    }
+    for desc in single_descriptors {
+        if desc.has_hardened_wildcard() {
+            log::error!("descriptor contains a hardened wildcard");
+            return Err(Error::HardenedWildcard);
+        }
+    }
     Ok(descriptor)
 }
 
@@ -580,6 +606,9 @@ fn error_status(error: &Error) -> StatusCode {
         | Error::AddressCannotBeBlinded
         | Error::TooManyAddresses
         | Error::DescriptorMustHaveWildcard
+        | Error::HardenedWildcard
+        | Error::DescriptorTooLong
+        | Error::TooManySingleDescriptors
         | Error::AddressPageRequiresSingleAddress
         | Error::UtxoOnlyHistoryTooLarge => StatusCode::BAD_REQUEST,
         Error::BodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
@@ -700,14 +729,14 @@ async fn handle_waterfalls_req(
                 log::info!("{id:x}: page={page}, to_index={to_index}, utxo_only={utxo_only}");
             }
             utxo_only_req = utxo_only;
-            for desc in descriptor.into_single_descriptors().unwrap().iter() {
+            for desc in descriptor.into_single_descriptors()?.iter() {
                 let single_descriptor_id = string_hash(&desc.normalized_id_string());
                 let is_single_address = !desc.has_wildcard();
                 let mut result = Vec::with_capacity(GAP_LIMIT as usize); // At least
                 for batch in 0..MAX_BATCH {
                     let batch_start = batch * GAP_LIMIT + page as u32 * MAX_ADDRESSES;
                     let (scripts, batch_derivations_duration) =
-                        derive_script_hashes_batch(state, desc, batch_start, GAP_LIMIT).await;
+                        derive_script_hashes_batch(state, desc, batch_start, GAP_LIMIT).await?;
                     derivations_duration += batch_derivations_duration;
 
                     let find_result = find_scripts(state, &mut result, scripts, 0, true).await?;
@@ -741,7 +770,7 @@ async fn handle_waterfalls_req(
                     }
                 }
                 if !is_single_address {
-                    expand_subscriptions(state, desc, single_descriptor_id).await;
+                    expand_subscriptions(state, desc, single_descriptor_id).await?;
                 }
                 if utxo_only {
                     filter_utxo_only(state, &mut result).await?;
@@ -899,7 +928,7 @@ async fn handle_last_used_index(
     let mut external_last_used: Option<u32> = None;
     let mut internal_last_used: Option<u32> = None;
 
-    for desc in descriptor.into_single_descriptors().unwrap().iter() {
+    for desc in descriptor.into_single_descriptors()?.iter() {
         // Determine if this is external (0/*) or internal (1/*) chain
         let is_internal = desc.to_string().contains("/1/*");
 
@@ -910,7 +939,7 @@ async fn handle_last_used_index(
         for batch in 0..MAX_BATCH {
             let batch_start = batch * GAP_LIMIT;
             let (scripts, _) =
-                derive_script_hashes_batch(state, desc, batch_start, GAP_LIMIT).await;
+                derive_script_hashes_batch(state, desc, batch_start, GAP_LIMIT).await?;
 
             // Check which scripts have history (either confirmed or mempool), the mempool is
             // read before the db, see `find_scripts`.
@@ -1021,7 +1050,7 @@ async fn subscribe_descriptor(
 ) -> Result<(SubscriptionId, SubscriptionReceiver), Error> {
     let mut scripts = Vec::new();
     let mut descriptors = HashMap::new();
-    let single_descriptors = descriptor.into_single_descriptors().unwrap();
+    let single_descriptors = descriptor.into_single_descriptors()?;
     for desc in single_descriptors.iter() {
         let single_descriptor_id = string_hash(&desc.normalized_id_string());
         let max_used_index = match state.descriptor_max_used_index(single_descriptor_id).await {
@@ -1037,7 +1066,7 @@ async fn subscribe_descriptor(
         let watch_count = subscription_watch_count(max_used_index)?;
         scripts.extend(
             derive_script_hashes_batch(state, desc, 0, watch_count)
-                .await
+                .await?
                 .0,
         );
         if desc.has_wildcard() {
@@ -1054,7 +1083,7 @@ async fn subscribe_descriptor(
     // the subscription was registered, in which case the scan's expansion missed this subscription.
     // Scans record the index before expanding, so re-checking after registering closes the gap.
     for desc in single_descriptors.iter().filter(|desc| desc.has_wildcard()) {
-        expand_subscriptions(state, desc, string_hash(&desc.normalized_id_string())).await;
+        expand_subscriptions(state, desc, string_hash(&desc.normalized_id_string())).await?;
     }
 
     Ok(subscription)
@@ -1066,23 +1095,24 @@ async fn expand_subscriptions(
     state: &Arc<State>,
     desc: &be::Descriptor,
     single_descriptor_id: u64,
-) {
+) -> Result<(), Error> {
     let Some(max_used_index) = state.descriptor_max_used_index(single_descriptor_id).await else {
-        return;
+        return Ok(());
     };
     let Ok(watch_count) = subscription_watch_count(max_used_index) else {
-        return;
+        return Ok(());
     };
     let Some((start, end)) = state
         .subscription_expansion_range(single_descriptor_id, watch_count)
         .await
     else {
-        return;
+        return Ok(());
     };
-    let (scripts, _) = derive_script_hashes_batch(state, desc, start, end - start).await;
+    let (scripts, _) = derive_script_hashes_batch(state, desc, start, end - start).await?;
     state
         .expand_subscriptions(single_descriptor_id, start, &scripts)
         .await;
+    Ok(())
 }
 
 async fn scan_descriptor_max_used_index(
@@ -1093,7 +1123,7 @@ async fn scan_descriptor_max_used_index(
 
     for batch in 0..MAX_BATCH {
         let batch_start = batch * GAP_LIMIT;
-        let (scripts, _) = derive_script_hashes_batch(state, desc, batch_start, GAP_LIMIT).await;
+        let (scripts, _) = derive_script_hashes_batch(state, desc, batch_start, GAP_LIMIT).await?;
 
         let mut result = Vec::with_capacity(GAP_LIMIT as usize);
         let find_result = find_scripts(state, &mut result, scripts, 0, true).await?;
@@ -1356,7 +1386,9 @@ fn calculate_script_pubkey_with_timing(
     index: u32,
 ) -> Result<(Vec<u8>, std::time::Duration), Error> {
     let start = Instant::now();
-    let script_pubkey = desc.script_pubkey_at_derivation_index(index)?;
+    let script_pubkey = desc
+        .script_pubkey_at_derivation_index(index)
+        .inspect_err(|e| log::error!("script derivation failed: {e}"))?;
     let duration = start.elapsed();
     Ok((script_pubkey, duration))
 }
@@ -1371,35 +1403,43 @@ async fn derive_script_hashes_batch(
     desc: &be::Descriptor,
     start_index: u32,
     count: u32,
-) -> (Vec<u64>, Duration) {
+) -> Result<(Vec<u64>, Duration), Error> {
     let desc_str = desc.to_string();
     let is_single_address = !desc.has_wildcard();
 
     let mut scripts = Vec::with_capacity(count as usize);
+    let mut missing = Vec::new();
     let mut derivations_duration = Duration::from_secs(0);
 
-    let mut derivation_cache = state.derivation_cache.lock().await;
-    for index in start_index..start_index + count {
-        let der_ind_hash = DerivationCache::hash(&desc_str, index);
-        let script_hash = match derivation_cache.get(der_ind_hash) {
-            Some(script_hash) => script_hash,
-            None => {
-                let (script_pubkey, duration) =
-                    calculate_script_pubkey_with_timing(desc, index).unwrap();
-                derivations_duration += duration;
-                let script_hash = state.store.hash(&script_pubkey);
-                derivation_cache.add(der_ind_hash, script_hash);
-                script_hash
+    {
+        let mut derivation_cache = state.derivation_cache.lock().await;
+        for index in start_index..start_index + count {
+            let der_ind_hash = DerivationCache::hash(&desc_str, index);
+            let script_hash = derivation_cache.get(der_ind_hash);
+            if script_hash.is_none() {
+                missing.push((scripts.len(), index, der_ind_hash));
             }
-        };
-
-        scripts.push(script_hash);
-        if is_single_address {
-            break;
+            scripts.push(script_hash.unwrap_or_default());
+            if is_single_address {
+                break;
+            }
         }
     }
 
-    (scripts, derivations_duration)
+    for &(position, index, _) in &missing {
+        let (script_pubkey, duration) = calculate_script_pubkey_with_timing(desc, index)?;
+        derivations_duration += duration;
+        scripts[position] = state.store.hash(&script_pubkey);
+    }
+
+    if !missing.is_empty() {
+        let mut derivation_cache = state.derivation_cache.lock().await;
+        for (position, _, der_ind_hash) in missing {
+            derivation_cache.add(der_ind_hash, scripts[position]);
+        }
+    }
+
+    Ok((scripts, derivations_duration))
 }
 
 /// This function is used to wrap the route function so that it never returns an error but always a response
@@ -1500,6 +1540,165 @@ mod tests {
     const BITCOIN_MAINNET_DESC: &str = "wpkh([a12b02f4/44'/0'/0']xpub6BzhLAQUDcBUfHRQHZxDF2AbcJqp4Kaeq6bzJpXrjrWuK26ymTFwkEFbxPra2bJ7yeZKbDjfDeFwxe93JMqpo5SsPJH6dZdvV9kMzJkAZ69/0/*)#20ufqv7z";
     const BITCOIN_TESTNET_DESC: &str = "wpkh(tpubDC8msFGeGuwnKG9Upg7DM2b4DaRqg3CUZa5g8v2SRQ6K4NSkxUgd7HsL2XVWbVm39yBA4LAxysQAm397zwQSQoQgewGiYZqrA9DsP4zbQ1M/<0;1>/*)#v7pu3vak";
     const CONFIDENTIAL_TESTNET_DESC: &str = "ct(slip77(1bda6cd71a1e206e3eb793e5a4d98a46c3fa473c9ab7bdef9bb9c814764d6614),elwpkh([cb4ba44a/84'/1'/0']tpubDDrybtUajFcgXC85rvwPsh1oU7Azx4kJ9BAiRzMbByqK7UnVXY3gDRJPwEDfaQwguNUZFzrhavJGgEhbsfuebyxUSZQnjLezWVm2Vdqb7UM/<0;1>/*))#za9ktavp";
+
+    fn assert_descriptor_query_error(descriptor: &str, network: Network, expected: Error) {
+        let key = Identity::generate();
+        let encrypted = encryption::encrypt(descriptor, key.to_public()).unwrap();
+        for value in [descriptor, encrypted.as_str()] {
+            let query = encode_query(value, None);
+            let error = parse_query(&query, &key, true, 100, network).unwrap_err();
+            assert_eq!(error, expected);
+            assert_eq!(error_status(&error), StatusCode::BAD_REQUEST);
+            let error = parse_descriptor_query(&query, &key, true, network).unwrap_err();
+            assert_eq!(error, expected);
+            assert_eq!(error_status(&error), StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[test]
+    fn hardened_wildcards_are_rejected() {
+        for (source, network) in [
+            (TESTNET_DESC, Network::LiquidTestnet),
+            (BITCOIN_TESTNET_DESC, Network::BitcoinTestnet),
+        ] {
+            let descriptor = source.split('#').next().unwrap();
+            for wildcard in ["*h", "*'"] {
+                let hardened = descriptor.replace('*', wildcard);
+                assert_descriptor_query_error(&hardened, network, Error::HardenedWildcard);
+                let single = hardened.replace("<0;1>", "0");
+                assert_descriptor_query_error(&single, network, Error::HardenedWildcard);
+            }
+
+            // A hardened wildcard on a later multisig key must also be rejected.
+            let key = descriptor
+                .split_once('(')
+                .unwrap()
+                .1
+                .strip_suffix(')')
+                .unwrap();
+            let prefix = if network == Network::LiquidTestnet {
+                "el"
+            } else {
+                ""
+            };
+            let multisig = format!("{prefix}wsh(multi(1,{key},{}))", key.replace('*', "*h"));
+            assert_descriptor_query_error(&multisig, network, Error::HardenedWildcard);
+        }
+    }
+
+    #[test]
+    fn excessive_descriptor_paths_are_rejected() {
+        let paths = (0..=MAX_SINGLE_DESCRIPTORS)
+            .map(|index| index.to_string())
+            .collect::<Vec<_>>()
+            .join(";");
+        for (source, network) in [
+            (TESTNET_DESC, Network::LiquidTestnet),
+            (BITCOIN_TESTNET_DESC, Network::BitcoinTestnet),
+        ] {
+            let descriptor = source.split('#').next().unwrap().replace("0;1", &paths);
+            assert_descriptor_query_error(&descriptor, network, Error::TooManySingleDescriptors);
+        }
+    }
+
+    #[test]
+    fn descriptor_length_is_checked_before_parsing() {
+        for network in [Network::LiquidTestnet, Network::BitcoinTestnet] {
+            assert_descriptor_query_error(
+                &"x".repeat(MAX_DESCRIPTOR_LENGTH + 1),
+                network,
+                Error::DescriptorTooLong,
+            );
+            // The limit counts characters, and a string at the limit reaches the parser.
+            assert!(matches!(
+                parse_bounded_descriptor(&"é".repeat(MAX_DESCRIPTOR_LENGTH), network),
+                Err(Error::InvalidDescriptor(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn normal_and_limit_multipath_descriptors_are_accepted() {
+        let key = Identity::generate();
+        let limit_paths = (0..MAX_SINGLE_DESCRIPTORS)
+            .map(|index| index.to_string())
+            .collect::<Vec<_>>()
+            .join(";");
+        for (source, network) in [
+            (TESTNET_DESC, Network::LiquidTestnet),
+            (BITCOIN_TESTNET_DESC, Network::BitcoinTestnet),
+        ] {
+            for (paths, count) in [("0;1", 2), (limit_paths.as_str(), MAX_SINGLE_DESCRIPTORS)] {
+                let descriptor = source.split('#').next().unwrap().replace("0;1", paths);
+                let encrypted = encryption::encrypt(&descriptor, key.to_public()).unwrap();
+                for value in [&descriptor, &encrypted] {
+                    let query = encode_query(value, None);
+                    let WaterfallRequest::Descriptor(request) =
+                        parse_query(&query, &key, true, 100, network).unwrap()
+                    else {
+                        panic!("expected descriptor request");
+                    };
+                    assert_eq!(
+                        request.descriptor.into_single_descriptors().unwrap().len(),
+                        count
+                    );
+                    let parsed = parse_descriptor_query(&query, &key, true, network).unwrap();
+                    assert_eq!(parsed.into_single_descriptors().unwrap().len(), count);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_derivation_preserves_order_across_cache_states() {
+        for (source, network) in [
+            (TESTNET_DESC, Network::LiquidTestnet),
+            (BITCOIN_TESTNET_DESC, Network::BitcoinTestnet),
+        ] {
+            let state = Arc::new(route_test_state());
+            let descriptor = source.split('#').next().unwrap().replace("<0;1>", "0");
+            let desc = be::Descriptor::from_str(&descriptor, network).unwrap();
+            let expected: Vec<_> = (5..5 + GAP_LIMIT)
+                .map(|index| {
+                    state
+                        .store
+                        .hash(&desc.script_pubkey_at_derivation_index(index).unwrap())
+                })
+                .collect();
+            let (cold, _) = derive_script_hashes_batch(&state, &desc, 5, GAP_LIMIT)
+                .await
+                .unwrap();
+            let (warm, duration) = derive_script_hashes_batch(&state, &desc, 5, GAP_LIMIT)
+                .await
+                .unwrap();
+            assert_eq!(cold, expected);
+            assert_eq!(warm, expected);
+            assert_eq!(duration, Duration::ZERO);
+
+            // Leave alternating cache hits to exercise interleaved hits and misses.
+            {
+                let mut cache = state.derivation_cache.lock().await;
+                *cache = DerivationCache::new(100);
+                for (position, &script) in expected.iter().enumerate().step_by(2) {
+                    cache.add(
+                        DerivationCache::hash(&desc.to_string(), 5 + position as u32),
+                        script,
+                    );
+                }
+            }
+            let (mixed, _) = derive_script_hashes_batch(&state, &desc, 5, GAP_LIMIT)
+                .await
+                .unwrap();
+            assert_eq!(mixed, expected);
+
+            let hardened =
+                be::Descriptor::from_str(&descriptor.replace('*', "*h"), network).unwrap();
+            assert!(derive_script_hashes_batch(&state, &hardened, 0, GAP_LIMIT)
+                .await
+                .is_err());
+            assert!(state.derivation_cache.try_lock().is_ok());
+        }
+    }
 
     #[test]
     fn test_parse_query() {

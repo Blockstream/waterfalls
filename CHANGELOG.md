@@ -28,6 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Descriptor requests reject hardened wildcards, descriptors longer than 8192 characters,
+  and descriptors expanding to more than eight paths with HTTP 400. Derivation errors are
+  propagated instead of panicking, and script derivation no longer holds the shared cache lock.
 - Store (RocksDB) reads and writes no longer run directly on the async runtime: HTTP handlers,
   the mempool sync and the block indexing loop now offload them to tokio's blocking thread
   pool. A slow disk read stalled every other task on the same worker, and could hang the
